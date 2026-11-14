@@ -1,6 +1,6 @@
 # 串口助手
 
-Rust 编写的 Windows x64 桌面程序。双击 `串口助手.exe` 即可启动。
+Rust 编写的 Windows x64 桌面程序。[下载 Windows x64 版](https://github.com/xupeihao/serial-assistant/releases/latest/download/serial-assistant-windows-x64.exe)，下载后双击 EXE 即可启动。
 
 1. 接好设备，点击「刷新」，选择 `COM` 端口。
 2. 按设备要求设置波特率、数据位、校验位、停止位和流控，再点击「打开串口」。默认值为 `115200 / 8N1 / 无流控`。
