@@ -1,5 +1,6 @@
 use std::io::{self, ErrorKind, Read, Write};
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -14,6 +15,14 @@ pub enum Event {
     Progress(u32, String),
     Cancelable(bool),
     Done(Result<(), String>),
+    TransferCount { received: u64, sent: u64 },
+}
+
+pub struct Request {
+    pub secure: Option<Firmware>,
+    pub nonsecure: Firmware,
+    pub manual: bool,
+    pub cancel: Arc<AtomicBool>,
 }
 
 pub struct Firmware {
@@ -190,6 +199,7 @@ impl<'a, P: Read + Write> Protocol<'a, P> {
         nonsecure: Firmware,
         manual: bool,
     ) -> io::Result<()> {
+        self.check_cancel()?;
         self.progress(
             0,
             if manual {
@@ -366,13 +376,17 @@ fn packet(index: u8, data: &[u8]) -> Vec<u8> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::rc::Rc;
 
-    fn image(nonsecure: bool) -> Firmware {
+    pub(crate) fn image(nonsecure: bool) -> Firmware {
+        Firmware::validate(image_bytes(nonsecure), nonsecure).unwrap()
+    }
+
+    pub(crate) fn image_bytes(nonsecure: bool) -> Vec<u8> {
         let mut bytes = vec![0; 0x408];
         let (stack, base) = if nonsecure {
             (0x24180000u32, 0x24100000u32)
@@ -391,7 +405,7 @@ mod tests {
         }
         let sum: u32 = bytes[0x400..].iter().map(|&b| u32::from(b)).sum();
         bytes[0x64..0x68].copy_from_slice(&sum.to_le_bytes());
-        Firmware::validate(bytes, nonsecure).unwrap()
+        bytes
     }
 
     struct FakePort {

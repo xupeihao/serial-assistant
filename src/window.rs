@@ -2,8 +2,9 @@ use crate::codec::{self, ReceiveFormat};
 use crate::control::{self, ControlWindow};
 use crate::file_dialog;
 use crate::preferences::{LOG_FONT_COUNT, LOG_FONT_SIZES, Preferences};
-use crate::serial_io::{self, Connection, Event, Packet, Settings};
-use crate::upgrade::UpgradeWindow;
+use crate::serial_io::{self, Command, Connection, Event, Packet, Settings};
+use crate::upgrade::{self, UpgradeWindow};
+use crate::upgrade_protocol::Event as UpgradeEvent;
 use crate::window_layout::WindowLayout;
 use encoding_rs::{Encoding, GBK, UTF_8};
 use serialport::{DataBits, FlowControl, Parity, StopBits};
@@ -770,6 +771,7 @@ struct App {
     upgrade: Option<UpgradeWindow>,
     session: Option<Connection>,
     connected: bool,
+    upgrading: bool,
     pending_send: Option<usize>,
     port_name: String,
     history: VecDeque<LogEntry>,
@@ -790,6 +792,7 @@ impl App {
             upgrade: None,
             session: None,
             connected: false,
+            upgrading: false,
             pending_send: None,
             port_name: String::new(),
             history: VecDeque::new(),
@@ -891,7 +894,9 @@ impl App {
         ] {
             self.ui.enable(id, idle);
         }
-        let button = if idle {
+        let button = if self.upgrading {
+            "升级中…"
+        } else if idle {
             "打开串口"
         } else if self.connected {
             "关闭串口"
@@ -899,12 +904,22 @@ impl App {
             "请稍候…"
         };
         self.ui.set_text(Id::Connect, button);
-        self.ui.enable(Id::Connect, idle || self.connected);
         self.ui
-            .enable(Id::Send, self.connected && self.pending_send.is_none());
+            .enable(Id::Connect, !self.upgrading && (idle || self.connected));
+        self.ui.enable(
+            Id::Send,
+            self.connected && self.pending_send.is_none() && !self.upgrading,
+        );
         self.ui.enable(Id::Ending, !self.ui.checked(Id::HexSend));
         if let Some(control) = &self.control {
-            control.set_connection(self.connected, self.pending_send.is_some());
+            control.set_connection(
+                self.connected,
+                self.pending_send.is_some() || self.upgrading,
+            );
+        }
+        if let Some(upgrade) = &self.upgrade {
+            upgrade
+                .set_connection(self.connected && self.pending_send.is_none() && !self.upgrading);
         }
     }
 
@@ -919,7 +934,10 @@ impl App {
             }
         }
         let control = self.control.as_ref().unwrap();
-        control.set_connection(self.connected, self.pending_send.is_some());
+        control.set_connection(
+            self.connected,
+            self.pending_send.is_some() || self.upgrading,
+        );
         control.status(&self.ui.text(Id::Status));
         control.show();
     }
@@ -941,10 +959,52 @@ impl App {
                 }
             }
         }
+        self.update_controls();
         self.upgrade.as_ref().unwrap().show();
     }
 
+    fn start_upgrade(&mut self) {
+        let Some(request) = self.upgrade.as_ref().and_then(UpgradeWindow::take_request) else {
+            return;
+        };
+        let result = if !self.connected {
+            Err("请先在主窗口打开串口")
+        } else if self.pending_send.is_some() || self.upgrading {
+            Err("串口正在发送或升级，请稍候")
+        } else if self
+            .session
+            .as_ref()
+            .and_then(|s| s.commands.as_ref())
+            .is_some_and(|commands| {
+                commands
+                    .try_send(Command::Upgrade(Box::new(request)))
+                    .is_ok()
+            })
+        {
+            Ok(())
+        } else {
+            Err("串口线程未接收升级请求，请重试")
+        };
+        if let Err(error) = result {
+            if let Some(upgrade) = &self.upgrade {
+                upgrade.event(&UpgradeEvent::Done(Err(error.into())));
+            }
+            self.status(error);
+            return;
+        }
+        self.upgrading = true;
+        self.update_controls();
+        self.status(&format!("{} · N6 升级中", self.port_name));
+        self.append_log(vec![LogEntry::note(format!(
+            "开始 N6 升级 · {} · 115200 / 8N1 / YMODEM",
+            self.port_name
+        ))]);
+    }
+
     fn toggle(&mut self) {
+        if self.upgrading {
+            return;
+        }
         if let Some(session) = &mut self.session {
             session.commands.take();
             self.connected = false;
@@ -1005,7 +1065,7 @@ impl App {
     }
 
     fn send_command(&mut self, raw: &str, hex: bool, ending: &str) {
-        if !self.connected || self.pending_send.is_some() {
+        if !self.connected || self.pending_send.is_some() || self.upgrading {
             return;
         }
         let data = match codec::encode(raw, hex, self.encoding(), ending) {
@@ -1025,7 +1085,7 @@ impl App {
             .and_then(|session| session.commands.as_ref())
         {
             let length = data.len();
-            if commands.try_send(data).is_ok() {
+            if commands.try_send(Command::Send(data)).is_ok() {
                 self.pending_send = Some(length);
                 self.update_controls();
                 self.status(&format!(
@@ -1098,6 +1158,7 @@ impl App {
                         batches.push(LogEntry {
                             packet,
                             send_result: None,
+                            annotation: false,
                             omitted: 0,
                             starts_session: std::mem::take(&mut self.first_receive_in_session),
                         });
@@ -1118,6 +1179,37 @@ impl App {
                 Ok(Event::Closed(error)) => {
                     self.disconnected(error.as_deref().unwrap_or("串口已关闭"));
                     break;
+                }
+                Ok(Event::Upgrade(event)) => {
+                    if let Some(upgrade) = &self.upgrade {
+                        upgrade.event(&event);
+                    }
+                    match event {
+                        UpgradeEvent::Log(text) => batches.push(LogEntry::note(text)),
+                        UpgradeEvent::Progress(value, text) => {
+                            self.status(&format!("{} · {text}", self.port_name));
+                            if value == 0 || value >= 99 {
+                                batches.push(LogEntry::note(text));
+                            }
+                        }
+                        UpgradeEvent::TransferCount { received, sent } => {
+                            self.rx += received;
+                            self.tx += sent;
+                            self.update_counter();
+                        }
+                        UpgradeEvent::Done(result) => {
+                            self.upgrading = false;
+                            self.first_receive_in_session = true;
+                            self.update_controls();
+                            let message = match result {
+                                Ok(()) => "升级完成，已恢复主窗口收发".to_string(),
+                                Err(error) => format!("升级结束 · {error}"),
+                            };
+                            self.status(&format!("{} · {message}", self.port_name));
+                            batches.push(LogEntry::note(message));
+                        }
+                        UpgradeEvent::Cancelable(_) => (),
+                    }
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -1198,6 +1290,13 @@ impl App {
     fn disconnected(&mut self, reason: &str) {
         self.session = None;
         self.connected = false;
+        if self.upgrading {
+            self.upgrading = false;
+            if let Some(upgrade) = &self.upgrade {
+                upgrade.event(&UpgradeEvent::Done(Err(reason.into())));
+            }
+            self.append_log(vec![LogEntry::note(format!("升级连接中断 · {reason}"))]);
+        }
         self.update_controls();
         self.status(&format!("未连接 · {reason}"));
         unsafe { KillTimer(self.ui.window, POLL_TIMER) };
@@ -1242,15 +1341,30 @@ struct SendResult {
 struct LogEntry {
     packet: Packet,
     send_result: Option<SendResult>,
+    annotation: bool,
     omitted: usize,
     starts_session: bool,
 }
 
 impl LogEntry {
+    fn note(text: String) -> Self {
+        Self {
+            packet: Packet {
+                time: serial_io::local_time(),
+                bytes: text.into_bytes(),
+            },
+            send_result: None,
+            annotation: true,
+            omitted: 0,
+            starts_session: false,
+        }
+    }
+
     fn sent(packet: Packet, result: SendResult) -> Self {
         Self {
             packet,
             send_result: Some(result),
+            annotation: false,
             omitted: 0,
             starts_session: false,
         }
@@ -1284,7 +1398,9 @@ impl LogEntry {
         if self.starts_session {
             *receive_format = ReceiveFormat::new(hex, encoding);
         }
-        let data = if self.send_result.is_some() {
+        let data = if self.annotation {
+            String::from_utf8_lossy(&self.packet.bytes).into_owned()
+        } else if self.send_result.is_some() {
             ReceiveFormat::new(hex, encoding).format_batch(&self.packet.bytes, true)
         } else {
             receive_format.format_batch(&self.packet.bytes, false)
@@ -1300,7 +1416,9 @@ impl LogEntry {
                 time.wHour, time.wMinute, time.wSecond, time.wMilliseconds
             );
         }
-        if let Some(result) = &self.send_result {
+        if self.annotation {
+            display.push_str("升级◆");
+        } else if let Some(result) = &self.send_result {
             display.push_str("发→◇");
             if result.error.is_some() {
                 let _ = write!(display, "[{}]", self.send_summary());
@@ -1638,6 +1756,7 @@ unsafe extern "system" fn window_proc(
         WM_SIZE
         | WM_COMMAND
         | control::SEND_MESSAGE
+        | upgrade::START_MESSAGE
         | WM_TIMER
         | WM_LBUTTONDOWN
         | WM_MOUSEMOVE
@@ -1652,6 +1771,7 @@ unsafe extern "system" fn window_proc(
                         WM_SIZE => app.resized(wparam),
                         WM_COMMAND => app.command(wparam & 0xffff, (wparam >> 16) as u32 & 0xffff),
                         control::SEND_MESSAGE => app.send_preset(),
+                        upgrade::START_MESSAGE => app.start_upgrade(),
                         WM_TIMER if wparam == POLL_TIMER => app.poll(),
                         WM_LBUTTONDOWN => app.ui.start_drag(mouse_point(lparam)),
                         WM_MOUSEMOVE => app.ui.move_divider(mouse_point(lparam)),
@@ -1833,7 +1953,9 @@ mod tests {
         app.ui.set_text(Id::SendText, "串口");
         app.ui.message(Id::Ending, CB_SETCURSEL, 1, 0);
         app.send();
-        let data = command_rx.try_recv().unwrap();
+        let Command::Send(data) = command_rx.try_recv().unwrap() else {
+            panic!("expected send");
+        };
         assert_eq!(data, "串口\r\n".as_bytes());
         assert!(app.ui.text(Id::Receive).is_empty());
         let first = SYSTEMTIME {
@@ -2016,7 +2138,10 @@ mod tests {
             assert_ne!(unsafe { IsWindowEnabled(button) }, 0);
             unsafe { SendMessageW(button, BM_CLICK, 0, 0) };
             app.send_preset();
-            assert_eq!(command_rx.try_recv().unwrap(), expected);
+            let Command::Send(actual) = command_rx.try_recv().unwrap() else {
+                panic!("expected send");
+            };
+            assert_eq!(actual, expected);
             assert_eq!(unsafe { IsWindowEnabled(button) }, 0);
             event_tx
                 .send(Event::Sent {
@@ -2032,6 +2157,92 @@ mod tests {
         }
         assert_eq!(app.ui.text(Id::SendText), "串口");
         assert!(app.ui.text(Id::Receive).contains("发→◇A1 B2 00"));
+        app.reset_receive_format();
+        app.show_upgrade();
+        let upgrade_hwnd = app.upgrade.as_ref().unwrap().hwnd();
+        for removed in [100, 101, 111] {
+            assert!(unsafe { GetDlgItem(upgrade_hwnd, removed) }.is_null());
+        }
+        let enabled = |id| unsafe { IsWindowEnabled(GetDlgItem(upgrade_hwnd, id)) != 0 };
+        assert!(enabled(108));
+        assert!(!enabled(104));
+        assert!(!enabled(110));
+        let fixture = std::env::temp_dir().join(format!(
+            "serial-assistant-upgrade-test-{}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&fixture, crate::upgrade_protocol::tests::image_bytes(true)).unwrap();
+        unsafe { SetDlgItemTextW(upgrade_hwnd, 106, wide(&fixture.to_string_lossy()).as_ptr()) };
+        for success in [true, false] {
+            unsafe { SendMessageW(GetDlgItem(upgrade_hwnd, 108), BM_CLICK, 0, 0) };
+            app.start_upgrade();
+            let Command::Upgrade(request) = command_rx.try_recv().unwrap() else {
+                panic!("expected shared upgrade");
+            };
+            assert!(app.upgrading && app.connected);
+            assert!(!enabled(108) && enabled(110));
+            assert_eq!(unsafe { IsWindowEnabled(app.ui.handle(Id::Send)) }, 0);
+            assert_eq!(unsafe { IsWindowEnabled(app.ui.handle(Id::Connect)) }, 0);
+            assert_eq!(unsafe { IsWindowEnabled(GetDlgItem(side, 200)) }, 0);
+            app.send();
+            app.toggle();
+            assert!(app.session.as_ref().unwrap().commands.is_some());
+            assert!(command_rx.try_recv().is_err());
+            event_tx
+                .send(Event::Upgrade(UpgradeEvent::Log("板端日志保持中文".into())))
+                .unwrap();
+            event_tx
+                .send(Event::Upgrade(UpgradeEvent::Progress(
+                    99,
+                    "等待安装".into(),
+                )))
+                .unwrap();
+            app.poll();
+            assert!(app.ui.text(Id::Receive).contains("升级◆板端日志保持中文"));
+            assert!(app.ui.text(Id::Receive).contains("升级◆等待安装"));
+            if success {
+                event_tx
+                    .send(Event::Upgrade(UpgradeEvent::Cancelable(false)))
+                    .unwrap();
+                app.poll();
+                assert!(!enabled(110));
+                assert!(!app.upgrade.as_ref().unwrap().request_close());
+                assert!(!request.cancel.load(std::sync::atomic::Ordering::Relaxed));
+            } else {
+                assert!(!app.upgrade.as_ref().unwrap().request_close());
+                assert!(request.cancel.load(std::sync::atomic::Ordering::Relaxed));
+            }
+            let (rx, tx) = (app.rx, app.tx);
+            event_tx
+                .send(Event::Upgrade(UpgradeEvent::TransferCount {
+                    received: 123,
+                    sent: 456,
+                }))
+                .unwrap();
+            event_tx
+                .send(Event::Upgrade(UpgradeEvent::Done(if success {
+                    Ok(())
+                } else {
+                    Err("已停止发送".into())
+                })))
+                .unwrap();
+            app.poll();
+            assert_eq!((app.rx, app.tx), (rx + 123, tx + 456));
+            assert!(!app.upgrading && app.connected);
+            assert!(enabled(108) && !enabled(110));
+            assert!(app.upgrade.as_ref().unwrap().request_close());
+            assert_ne!(unsafe { IsWindowEnabled(app.ui.handle(Id::Send)) }, 0);
+            assert_ne!(unsafe { IsWindowEnabled(GetDlgItem(side, 200)) }, 0);
+            let before = app.ui.text(Id::Receive);
+            app.reset_receive_format();
+            assert_eq!(app.ui.text(Id::Receive), before);
+        }
+        std::fs::remove_file(fixture).unwrap();
+        let before = app.ui.text(Id::Receive);
+        app.disconnected("测试断开");
+        assert!(!enabled(108));
+        assert_eq!(app.ui.text(Id::Receive), before);
+        app.upgrade.take();
         app.control.take();
         unsafe {
             DestroyWindow(host);

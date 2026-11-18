@@ -1,5 +1,6 @@
+use crate::upgrade_protocol::{self, Protocol, Request};
 use serialport::{DataBits, FlowControl, Parity, SerialPort, StopBits};
-use std::io::{self, ErrorKind};
+use std::io::{self, ErrorKind, Read, Write};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::SYSTEMTIME;
@@ -28,6 +29,12 @@ pub enum Event {
         error: Option<String>,
     },
     Closed(Option<String>),
+    Upgrade(upgrade_protocol::Event),
+}
+
+pub enum Command {
+    Send(Vec<u8>),
+    Upgrade(Box<Request>),
 }
 
 pub struct Packet {
@@ -87,7 +94,7 @@ pub fn local_time() -> SYSTEMTIME {
 }
 
 pub struct Connection {
-    pub commands: Option<SyncSender<Vec<u8>>>,
+    pub commands: Option<SyncSender<Command>>,
     pub events: Receiver<Event>,
 }
 
@@ -97,7 +104,7 @@ pub fn connect(settings: Settings) -> io::Result<Connection> {
     std::thread::Builder::new()
         .name("serial-io".into())
         .spawn(move || {
-            let result = serialport::new(settings.port, settings.baud)
+            let result = serialport::new(&settings.port, settings.baud)
                 .data_bits(settings.data_bits)
                 .parity(settings.parity)
                 .stop_bits(settings.stop_bits)
@@ -115,7 +122,7 @@ pub fn connect(settings: Settings) -> io::Result<Connection> {
                 return;
             }
 
-            let reason = exchange(&mut *port, settings.baud, command_rx, &event_tx);
+            let reason = exchange(&mut *port, &settings, command_rx, &event_tx);
             drop(port);
             let _ = event_tx.send(Event::Closed(reason));
         })?;
@@ -127,18 +134,36 @@ pub fn connect(settings: Settings) -> io::Result<Connection> {
 
 fn exchange(
     port: &mut dyn SerialPort,
-    baud: u32,
-    commands: Receiver<Vec<u8>>,
+    settings: &Settings,
+    commands: Receiver<Command>,
     events: &SyncSender<Event>,
 ) -> Option<String> {
     let mut input = [0; 8192];
     let mut incoming = ReceiveRecords::default();
     let mut outgoing: Option<(Vec<u8>, usize)> = None;
     // Keep each synchronous driver write short so reads and closing get a turn.
-    let write_chunk = (baud as usize / 120).clamp(1, 8192);
+    let write_chunk = (settings.baud as usize / 120).clamp(1, 8192);
     let closed = loop {
         match commands.try_recv() {
-            Ok(data) => outgoing = Some((data, 0)),
+            Ok(Command::Send(data)) => outgoing = Some((data, 0)),
+            Ok(Command::Upgrade(request)) => {
+                if outgoing.is_some() {
+                    let _ = events.send(Event::Upgrade(upgrade_protocol::Event::Done(Err(
+                        "正在发送，请稍后开始升级".into(),
+                    ))));
+                    continue;
+                }
+                if let Some(packet) = incoming.pending.take()
+                    && events.send(Event::Received(vec![packet])).is_err()
+                {
+                    return None;
+                }
+                if let Err(error) = run_upgrade(port, settings, *request, events) {
+                    break Some(format!("恢复串口设置失败 · {error}"));
+                }
+                incoming = ReceiveRecords::default();
+                continue;
+            }
             Err(TryRecvError::Empty) => (),
             Err(TryRecvError::Disconnected) => break None,
         }
@@ -203,6 +228,86 @@ fn report_send(
         requested,
         error,
     })
+}
+
+fn run_upgrade(
+    port: &mut dyn SerialPort,
+    settings: &Settings,
+    request: Request,
+    events: &SyncSender<Event>,
+) -> io::Result<()> {
+    let mut received = 0;
+    let mut sent = 0;
+    let result = (|| {
+        port.set_baud_rate(115200)?;
+        port.set_data_bits(DataBits::Eight)?;
+        port.set_parity(Parity::None)?;
+        port.set_stop_bits(StopBits::One)?;
+        port.set_flow_control(FlowControl::None)?;
+        port.set_timeout(Duration::from_millis(100))?;
+        let callback = |event| {
+            let _ = events.send(Event::Upgrade(event));
+        };
+        let io = UpgradePort {
+            port,
+            received: &mut received,
+            sent: &mut sent,
+        };
+        Protocol::new(io, &callback, &request.cancel).run(
+            request.secure,
+            request.nonsecure,
+            request.manual,
+        )
+    })();
+    // Always restore the existing connection, including after cancellation or a protocol error.
+    let restored = (|| {
+        port.set_baud_rate(settings.baud)?;
+        port.set_data_bits(settings.data_bits)?;
+        port.set_parity(settings.parity)?;
+        port.set_stop_bits(settings.stop_bits)?;
+        port.set_flow_control(settings.flow)?;
+        port.set_timeout(READ_TIMEOUT)?;
+        Ok::<_, io::Error>(())
+    })();
+    let _ = events.send(Event::Upgrade(upgrade_protocol::Event::TransferCount {
+        received,
+        sent,
+    }));
+    let outcome = match &restored {
+        Ok(()) => result.map_err(|error| error.to_string()),
+        Err(error) => Err(format!("升级已结束，恢复串口失败 · {error}")),
+    };
+    let _ = events.send(Event::Upgrade(upgrade_protocol::Event::Done(outcome)));
+    restored
+}
+
+struct UpgradePort<'a> {
+    port: &'a mut dyn SerialPort,
+    received: &'a mut u64,
+    sent: &'a mut u64,
+}
+
+impl Read for UpgradePort<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let count = self.port.read(buffer)?;
+        *self.received += count as u64;
+        Ok(count)
+    }
+}
+
+impl Write for UpgradePort<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.port.set_timeout(Duration::from_secs(2))?;
+        let result = self.port.write(bytes);
+        if let Ok(count) = result {
+            *self.sent += count as u64;
+        }
+        self.port.set_timeout(Duration::from_millis(100))?;
+        result
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.port.flush()
+    }
 }
 
 fn write_chunk_once(port: &mut dyn SerialPort, bytes: &[u8]) -> (usize, Option<String>) {
@@ -280,5 +385,216 @@ mod tests {
         assert_eq!(packet.bytes, [0xAA]);
         assert_eq!(requested, 3);
         assert_eq!(error.as_deref(), Some("超时"));
+    }
+}
+
+#[cfg(test)]
+mod shared_upgrade_tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    struct ExistingPort {
+        settings: Settings,
+        timeout: Duration,
+        input: VecDeque<u8>,
+        writes: Vec<Vec<u8>>,
+        fail_baud: u32,
+    }
+
+    impl Read for ExistingPort {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            bytes[0] = self
+                .input
+                .pop_front()
+                .ok_or_else(|| io::Error::other("response exhausted"))?;
+            Ok(1)
+        }
+    }
+    impl Write for ExistingPort {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.writes.push(bytes.to_vec());
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl SerialPort for ExistingPort {
+        fn name(&self) -> Option<String> {
+            Some(self.settings.port.clone())
+        }
+        fn baud_rate(&self) -> serialport::Result<u32> {
+            Ok(self.settings.baud)
+        }
+        fn data_bits(&self) -> serialport::Result<DataBits> {
+            Ok(self.settings.data_bits)
+        }
+        fn flow_control(&self) -> serialport::Result<FlowControl> {
+            Ok(self.settings.flow)
+        }
+        fn parity(&self) -> serialport::Result<Parity> {
+            Ok(self.settings.parity)
+        }
+        fn stop_bits(&self) -> serialport::Result<StopBits> {
+            Ok(self.settings.stop_bits)
+        }
+        fn timeout(&self) -> Duration {
+            self.timeout
+        }
+        fn set_baud_rate(&mut self, value: u32) -> serialport::Result<()> {
+            if value == self.fail_baud {
+                return Err(serialport::Error::new(
+                    serialport::ErrorKind::NoDevice,
+                    "device disconnected",
+                ));
+            }
+            self.settings.baud = value;
+            Ok(())
+        }
+        fn set_data_bits(&mut self, value: DataBits) -> serialport::Result<()> {
+            self.settings.data_bits = value;
+            Ok(())
+        }
+        fn set_flow_control(&mut self, value: FlowControl) -> serialport::Result<()> {
+            self.settings.flow = value;
+            Ok(())
+        }
+        fn set_parity(&mut self, value: Parity) -> serialport::Result<()> {
+            self.settings.parity = value;
+            Ok(())
+        }
+        fn set_stop_bits(&mut self, value: StopBits) -> serialport::Result<()> {
+            self.settings.stop_bits = value;
+            Ok(())
+        }
+        fn set_timeout(&mut self, value: Duration) -> serialport::Result<()> {
+            self.timeout = value;
+            Ok(())
+        }
+        fn write_request_to_send(&mut self, _: bool) -> serialport::Result<()> {
+            panic!("must not toggle RTS")
+        }
+        fn write_data_terminal_ready(&mut self, _: bool) -> serialport::Result<()> {
+            panic!("must not toggle DTR")
+        }
+        fn read_clear_to_send(&mut self) -> serialport::Result<bool> {
+            unimplemented!()
+        }
+        fn read_data_set_ready(&mut self) -> serialport::Result<bool> {
+            unimplemented!()
+        }
+        fn read_ring_indicator(&mut self) -> serialport::Result<bool> {
+            unimplemented!()
+        }
+        fn read_carrier_detect(&mut self) -> serialport::Result<bool> {
+            unimplemented!()
+        }
+        fn bytes_to_read(&self) -> serialport::Result<u32> {
+            Ok(self.input.len() as u32)
+        }
+        fn bytes_to_write(&self) -> serialport::Result<u32> {
+            Ok(0)
+        }
+        fn clear(&self, _: serialport::ClearBuffer) -> serialport::Result<()> {
+            panic!("must not discard data")
+        }
+        fn try_clone(&self) -> serialport::Result<Box<dyn SerialPort>> {
+            panic!("must use the existing port")
+        }
+        fn set_break(&self) -> serialport::Result<()> {
+            unimplemented!()
+        }
+        fn clear_break(&self) -> serialport::Result<()> {
+            unimplemented!()
+        }
+    }
+
+    fn original() -> Settings {
+        Settings {
+            port: "EXISTING".into(),
+            baud: 9600,
+            data_bits: DataBits::Seven,
+            parity: Parity::Even,
+            stop_bits: StopBits::Two,
+            flow: FlowControl::Hardware,
+        }
+    }
+
+    #[test]
+    fn upgrade_reuses_the_open_port_and_restores_it_after_success_cancel_or_failure() {
+        // Each case uses one existing port object, then performs ordinary I/O on that object.
+        for mode in 0..5 {
+            let input = match mode {
+                0 | 4 => {
+                    let mut response = b"REBOOTING\n[BOOT] Press U for update\n[UPGRADE] 1 AppNS  2 AppS + AppNS  0 Boot\n[YMODEM] Send AppNS -trusted.bin\n".to_vec();
+                    response.extend([b'C', 6, b'C', 6, 6, 6, b'C', 6]);
+                    response.extend(b"[UPGRADE] Installed, done\nSTM32N6 AppNS\nVersion: test\n");
+                    response
+                }
+                2 => b"BUSY\n".to_vec(),
+                _ => Vec::new(),
+            };
+            let expected_rx = input.len() as u64;
+            let mut port = ExistingPort {
+                settings: original(),
+                timeout: READ_TIMEOUT,
+                input: input.into(),
+                writes: Vec::new(),
+                fail_baud: match mode {
+                    3 => 115200,
+                    4 => 9600,
+                    _ => 0,
+                },
+            };
+            let request = Request {
+                secure: None,
+                nonsecure: upgrade_protocol::tests::image(true),
+                manual: false,
+                cancel: Arc::new(AtomicBool::new(mode == 1)),
+            };
+            let (sender, receiver) = mpsc::sync_channel(128);
+            let restored = run_upgrade(&mut port, &original(), request, &sender);
+            assert_eq!(restored.is_ok(), mode != 4);
+            let mut counted = false;
+            let mut finished = false;
+            for event in receiver.try_iter() {
+                match event {
+                    Event::Upgrade(upgrade_protocol::Event::TransferCount { received, sent }) => {
+                        assert_eq!(received, expected_rx);
+                        assert_eq!(
+                            sent,
+                            port.writes.iter().map(|b| b.len() as u64).sum::<u64>()
+                        );
+                        counted = true;
+                    }
+                    Event::Upgrade(upgrade_protocol::Event::Done(result)) => {
+                        assert!(counted);
+                        assert_eq!(result.is_ok(), mode == 0);
+                        finished = true;
+                    }
+                    _ => (),
+                }
+            }
+            assert!(finished);
+            if mode == 4 {
+                continue;
+            }
+            assert_eq!(port.baud_rate().unwrap(), 9600);
+            assert_eq!(port.data_bits().unwrap(), DataBits::Seven);
+            assert_eq!(port.parity().unwrap(), Parity::Even);
+            assert_eq!(port.stop_bits().unwrap(), StopBits::Two);
+            assert_eq!(port.flow_control().unwrap(), FlowControl::Hardware);
+            assert_eq!(port.timeout(), READ_TIMEOUT);
+            if mode == 1 || mode == 3 {
+                assert!(port.writes.is_empty());
+            }
+            port.input.extend(b"normal");
+            let mut byte = [0];
+            port.read_exact(&mut byte).unwrap();
+            assert_eq!(&byte, b"n");
+            assert_eq!(write_chunk_once(&mut port, b"AT?"), (3, None));
+            assert_eq!(port.writes.last().unwrap(), b"AT?");
+        }
     }
 }

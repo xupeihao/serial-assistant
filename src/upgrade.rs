@@ -1,8 +1,6 @@
 use crate::file_dialog;
-use crate::serial_io;
-use crate::upgrade_protocol::{Event, Firmware, Protocol};
+use crate::upgrade_protocol::{Event, Firmware, Request};
 use crate::window::wide;
-use crate::window_layout::WindowLayout;
 use std::cell::RefCell;
 use std::io;
 use std::path::Path;
@@ -10,16 +8,14 @@ use std::ptr::null;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
-    mpsc::{self, Receiver},
 };
-use std::time::Duration;
 use windows_sys::Win32::Foundation::*;
-use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::*;
-use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
+
+pub const START_MESSAGE: u32 = WM_APP + 2;
 
 pub struct UpgradeWindow {
     state: Box<RefCell<Upgrade>>,
@@ -29,13 +25,13 @@ impl UpgradeWindow {
     pub fn create(owner: HWND) -> io::Result<Self> {
         let state = Box::new(RefCell::new(Upgrade {
             window: std::ptr::null_mut(),
-            worker: None,
+            owner,
+            active: false,
+            connected: false,
+            pending: None,
             cancel: Arc::new(AtomicBool::new(false)),
             cancelable: true,
             paired: false,
-            layout: WindowLayout::default(),
-            initial_size: (0, 0),
-            original: Vec::new(),
         }));
         let window = unsafe {
             CreateDialogParamW(
@@ -63,9 +59,55 @@ impl UpgradeWindow {
         }
     }
 
+    pub fn set_connection(&self, connected: bool) {
+        let mut ui = self.state.borrow_mut();
+        ui.connected = connected;
+        if !ui.active {
+            set(
+                ui.window,
+                118,
+                if connected {
+                    "使用主窗口串口 · 升级日志显示在主窗口"
+                } else {
+                    "请先在主窗口打开串口 · 升级日志显示在主窗口"
+                },
+            );
+        }
+        ui.update();
+    }
+
+    pub fn take_request(&self) -> Option<Request> {
+        self.state.borrow_mut().pending.take()
+    }
+
+    pub fn event(&self, event: &Event) {
+        let mut ui = self.state.borrow_mut();
+        match event {
+            Event::Progress(value, text) => {
+                unsafe { SendDlgItemMessageW(ui.window, 112, PBM_SETPOS, *value as usize, 0) };
+                set(ui.window, 113, text);
+            }
+            Event::Cancelable(allowed) => ui.cancelable = *allowed,
+            Event::Done(result) => {
+                ui.active = false;
+                ui.pending = None;
+                set(
+                    ui.window,
+                    113,
+                    match result {
+                        Ok(()) => "升级完成，已恢复主窗口收发",
+                        Err(error) => error,
+                    },
+                );
+            }
+            _ => (),
+        }
+        ui.update();
+    }
+
     pub fn request_close(&self) -> bool {
         let ui = self.state.borrow();
-        if ui.worker.is_none() {
+        if !ui.active {
             return true;
         }
         if ui.cancelable {
@@ -92,13 +134,13 @@ impl Drop for UpgradeWindow {
 
 struct Upgrade {
     window: HWND,
-    worker: Option<Receiver<Event>>,
+    owner: HWND,
+    active: bool,
+    connected: bool,
+    pending: Option<Request>,
     cancel: Arc<AtomicBool>,
     cancelable: bool,
     paired: bool,
-    layout: WindowLayout,
-    initial_size: (i32, i32),
-    original: Vec<(HWND, RECT, i32)>,
 }
 
 fn text(window: HWND, id: i32) -> String {
@@ -136,114 +178,31 @@ impl Upgrade {
         fill(window, 102, &["由 AppNS 命令进入", "手动复位或上电进入"]);
         fill(window, 103, &["仅 AppNS", "AppS 和 AppNS 配套升级"]);
         unsafe {
-            SendDlgItemMessageW(window, 111, EM_SETLIMITTEXT, 160000, 0);
             SendDlgItemMessageW(window, 104, EM_SETLIMITTEXT, 32767, 0);
             SendDlgItemMessageW(window, 106, EM_SETLIMITTEXT, 32767, 0);
         }
-        let mut client = RECT::default();
-        unsafe { GetClientRect(window, &mut client) };
-        self.initial_size = (client.right, client.bottom);
-        let mut child = unsafe { GetWindow(window, GW_CHILD) };
-        while !child.is_null() {
-            let mut rect = RECT::default();
-            unsafe {
-                GetWindowRect(child, &mut rect);
-                MapWindowPoints(std::ptr::null_mut(), window, (&raw mut rect).cast(), 2);
-            }
-            self.original
-                .push((child, rect, unsafe { GetDlgCtrlID(child) }));
-            child = unsafe { GetWindow(child, GW_HWNDNEXT) };
-        }
-        self.refresh();
-    }
-
-    fn resize(&self) {
-        let mut client = RECT::default();
-        unsafe { GetClientRect(self.window, &mut client) };
-        let dx = client.right - self.initial_size.0;
-        let dy = client.bottom - self.initial_size.1;
-        self.layout.apply(
-            self.window,
-            96,
-            self.original.iter().map(|&(hwnd, rect, id)| {
-                let mut x = rect.left;
-                let mut y = rect.top;
-                let mut width = rect.right - rect.left;
-                let mut height = rect.bottom - rect.top;
-                match id {
-                    102 | 103 | 104 | 106 | 111 | 112 | 113 => width += dx,
-                    105 | 107 | 118 => x += dx,
-                    _ => (),
-                }
-                if id == 111 {
-                    height += dy;
-                }
-                if id == 112 || id == 113 {
-                    y += dy;
-                }
-                // Combo box height includes the popup, while GetWindowRect gives the closed height.
-                if [100, 102, 103].contains(&id) {
-                    height += 150;
-                }
-                (hwnd, x, y, width, height)
-            }),
-        );
+        self.update();
     }
 
     fn update(&self) {
-        let idle = self.worker.is_none();
-        for id in [100, 101, 102, 103, 104, 105, 106, 107, 108, 110] {
+        let idle = !self.active;
+        for id in [102, 103, 104, 105, 106, 107, 108, 110] {
             let enabled = match id {
                 110 => !idle && self.cancelable,
                 104 | 105 => idle && self.paired,
-                108 => idle && !text(self.window, 100).is_empty(),
+                108 => idle && self.connected,
                 _ => idle,
             };
             unsafe { EnableWindow(GetDlgItem(self.window, id), i32::from(enabled)) };
         }
     }
 
-    fn refresh(&mut self) {
-        let previous = text(self.window, 100);
-        match serialport::available_ports() {
-            Ok(mut ports) => {
-                ports.sort_by(|a, b| a.port_name.cmp(&b.port_name));
-                fill(
-                    self.window,
-                    100,
-                    &ports
-                        .iter()
-                        .map(|p| p.port_name.as_str())
-                        .collect::<Vec<_>>(),
-                );
-                if let Some(index) = ports.iter().position(|p| p.port_name == previous) {
-                    unsafe { SendDlgItemMessageW(self.window, 100, CB_SETCURSEL, index, 0) };
-                }
-            }
-            Err(error) => set(self.window, 113, &format!("刷新失败 · {error}")),
-        }
-        self.update();
-    }
-
-    fn log(&self, message: &str) {
-        let now = serial_io::local_time();
-        let line = wide(&format!(
-            "{:02}:{:02}:{:02}.{:03}  {message}\r\n",
-            now.wHour, now.wMinute, now.wSecond, now.wMilliseconds
-        ));
-        unsafe {
-            let log = GetDlgItem(self.window, 111);
-            if GetWindowTextLengthW(log) > 120000 {
-                SetWindowTextW(log, wide("").as_ptr());
-            }
-            SendMessageW(log, EM_SETSEL, i32::MAX as usize, i32::MAX as isize);
-            SendMessageW(log, EM_REPLACESEL, 0, line.as_ptr() as LPARAM);
-            SendMessageW(log, WM_VSCROLL, SB_BOTTOM as usize, 0);
-        }
-    }
-
     fn start(&mut self) {
-        if self.worker.is_some() {
+        if self.active {
+            return;
+        }
+        if !self.connected {
+            set(self.window, 113, "请先在主窗口打开串口");
             return;
         }
         let images = (|| {
@@ -259,107 +218,27 @@ impl Upgrade {
             Ok(images) => images,
             Err(error) => {
                 set(self.window, 113, &error.to_string());
-                self.log(&error.to_string());
                 return;
             }
         };
-        let name = text(self.window, 100);
-        let manual = choice(self.window, 102) == 1;
-        let (tx, rx) = mpsc::channel();
         self.cancel = Arc::new(AtomicBool::new(false));
-        let cancel = self.cancel.clone();
-        // A timer is required before the worker can deliver any result.
-        if unsafe { SetTimer(self.window, 1, 40, None) } == 0 {
-            set(self.window, 113, "无法启动升级状态检查");
-            return;
-        }
-        self.log(&format!("开始升级 · {name}"));
-        let thread = std::thread::Builder::new()
-            .name("n6-upgrade".into())
-            .spawn(move || {
-                let events = |event| {
-                    let _ = tx.send(event);
-                };
-                let result = (|| {
-                    let mut port = serialport::new(name, 115200)
-                        .timeout(Duration::from_millis(100))
-                        .open()
-                        .map_err(|error| {
-                            io::Error::other(format!(
-                                "打开串口失败 · {error}。同一 COM 口请先在主窗口关闭"
-                            ))
-                        })?;
-                    port.set_timeout(Duration::from_millis(100))?;
-                    let mut protocol = Protocol::new(UpgradePort(port), &events, &cancel);
-                    let (secure, ns) = images;
-                    protocol.run(secure, ns, manual)
-                })();
-                events(Event::Done(result.map_err(|error| error.to_string())));
-            });
-        if let Err(error) = thread {
-            unsafe { KillTimer(self.window, 1) };
-            set(self.window, 113, &error.to_string());
-            return;
-        }
-        self.worker = Some(rx);
+        let (secure, nonsecure) = images;
+        self.pending = Some(Request {
+            secure,
+            nonsecure,
+            manual: choice(self.window, 102) == 1,
+            cancel: self.cancel.clone(),
+        });
+        self.active = true;
         self.cancelable = true;
         unsafe { SendDlgItemMessageW(self.window, 112, PBM_SETPOS, 0, 0) };
-        set(self.window, 113, "正在连接串口");
-        self.update();
-    }
-
-    fn poll(&mut self) {
-        for _ in 0..128 {
-            let Some(rx) = &self.worker else {
-                return;
-            };
-            match rx.try_recv() {
-                Ok(Event::Log(text)) => self.log(&text),
-                Ok(Event::Progress(value, text)) => {
-                    unsafe { SendDlgItemMessageW(self.window, 112, PBM_SETPOS, value as usize, 0) };
-                    set(self.window, 113, &text);
-                }
-                Ok(Event::Cancelable(allowed)) => {
-                    self.cancelable = allowed;
-                    self.update();
-                }
-                Ok(Event::Done(result)) => {
-                    if let Err(error) = result {
-                        self.log(&error);
-                        set(self.window, 113, &error);
-                    }
-                    self.worker = None;
-                    unsafe { KillTimer(self.window, 1) };
-                    self.update();
-                }
-                Err(mpsc::TryRecvError::Empty) => return,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.worker = None;
-                    unsafe { KillTimer(self.window, 1) };
-                    set(self.window, 113, "升级线程已退出，请检查日志");
-                    self.update();
-                }
-            }
+        set(self.window, 113, "正在接管主窗口串口");
+        if unsafe { PostMessageW(self.owner, START_MESSAGE, 0, 0) } == 0 {
+            self.active = false;
+            self.pending = None;
+            set(self.window, 113, "无法提交升级请求，请重试");
         }
-    }
-}
-
-// serialport's timeout applies to both reads and writes on Windows.
-struct UpgradePort(Box<dyn serialport::SerialPort>);
-impl io::Read for UpgradePort {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buffer)
-    }
-}
-impl io::Write for UpgradePort {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.set_timeout(Duration::from_secs(2))?;
-        let result = self.0.write(bytes);
-        self.0.set_timeout(Duration::from_millis(100))?;
-        result
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        self.0.flush()
+        self.update();
     }
 }
 
@@ -373,7 +252,7 @@ unsafe extern "system" fn dialog_proc(
         unsafe { SetWindowLongPtrW(window, GWLP_USERDATA, lparam) };
         let state = unsafe { &*(lparam as *const RefCell<Upgrade>) };
         state.borrow_mut().init(window);
-        unsafe { SetFocus(GetDlgItem(window, 100)) };
+        unsafe { SetFocus(GetDlgItem(window, 102)) };
         return 0;
     }
     let state = unsafe { GetWindowLongPtrW(window, GWLP_USERDATA) } as *const RefCell<Upgrade>;
@@ -393,38 +272,10 @@ unsafe extern "system" fn dialog_proc(
         }
         return 1;
     }
-    if msg == WM_GETMINMAXINFO {
-        if let Ok(ui) = state.try_borrow() {
-            if ui.initial_size.0 == 0 {
-                return 0;
-            }
-            let mut bounds = RECT::default();
-            let mut client = RECT::default();
-            unsafe {
-                GetWindowRect(window, &mut bounds);
-                GetClientRect(window, &mut client);
-            }
-            let dpi = unsafe { GetDpiForWindow(window) }.max(96);
-            let info = unsafe { &mut *(lparam as *mut MINMAXINFO) };
-            info.ptMinTrackSize.x = (660 * dpi / 96) as i32;
-            let log_height = ui
-                .original
-                .iter()
-                .find(|(_, _, id)| *id == 111)
-                .map_or(0, |(_, rect, _)| rect.bottom - rect.top);
-            info.ptMinTrackSize.y =
-                ui.initial_size.1 - log_height + (90 * dpi / 96) as i32 + bounds.bottom
-                    - bounds.top
-                    - client.bottom;
-        }
-        return 1;
-    }
     if let Ok(mut ui) = state.try_borrow_mut() {
         match msg {
-            WM_TIMER => ui.poll(),
-            WM_SIZE if wparam != SIZE_MINIMIZED as usize => ui.resize(),
             WM_CLOSE => {
-                if ui.worker.is_some() {
+                if ui.active {
                     if ui.cancelable {
                         ui.cancel.store(true, Ordering::Relaxed);
                     }
@@ -442,8 +293,6 @@ unsafe extern "system" fn dialog_proc(
                 }
             }
             WM_COMMAND => match wparam & 0xffff {
-                100 => ui.update(),
-                101 => ui.refresh(),
                 103 => {
                     ui.paired = choice(window, 103) == 1;
                     ui.update();
