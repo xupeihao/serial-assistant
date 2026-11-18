@@ -1,3 +1,4 @@
+use crate::presets::{Ending, TimeFormat};
 use crate::upgrade_protocol::{self, Protocol, Request};
 use serialport::{DataBits, FlowControl, Parity, SerialPort, StopBits};
 use std::io::{self, ErrorKind, Read, Write};
@@ -34,6 +35,7 @@ pub enum Event {
 
 pub enum Command {
     Send(Vec<u8>),
+    SendTime { format: TimeFormat, ending: Ending },
     Upgrade(Box<Request>),
 }
 
@@ -146,6 +148,10 @@ fn exchange(
     let closed = loop {
         match commands.try_recv() {
             Ok(Command::Send(data)) => outgoing = Some((data, 0)),
+            Ok(Command::SendTime { format, ending }) => {
+                // Resolve the clock in the serial worker, immediately before its first write.
+                outgoing = Some((format.payload(local_time(), ending), 0));
+            }
             Ok(Command::Upgrade(request)) => {
                 if outgoing.is_some() {
                     let _ = events.send(Event::Upgrade(upgrade_protocol::Event::Done(Err(

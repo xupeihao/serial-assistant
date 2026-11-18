@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use windows_sys::Win32::Foundation::SYSTEMTIME;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub enum Ending {
@@ -29,12 +30,45 @@ impl Ending {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+pub enum TimeFormat {
+    RtcSetDateTime,
+}
+
+impl TimeFormat {
+    pub const OPTIONS: [Self; 1] = [Self::RtcSetDateTime];
+    pub const LABELS: [&str; 1] = ["RTCSET YYYY-MM-DD HH:mm:ss"];
+
+    pub fn render(self, time: SYSTEMTIME) -> String {
+        match self {
+            Self::RtcSetDateTime => format!(
+                "RTCSET {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond
+            ),
+        }
+    }
+
+    pub fn byte_len(self, ending: Ending) -> usize {
+        match self {
+            Self::RtcSetDateTime => 26 + ending.text().len(),
+        }
+    }
+
+    pub fn payload(self, time: SYSTEMTIME, ending: Ending) -> Vec<u8> {
+        let mut command = self.render(time);
+        command.push_str(ending.text());
+        command.into_bytes()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Preset {
     pub name: String,
     pub content: String,
     pub hex: bool,
     pub ending: Ending,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_format: Option<TimeFormat>,
 }
 
 impl Preset {
@@ -46,6 +80,15 @@ impl Preset {
     }
 
     pub fn validate_content(&self) -> Result<(), &'static str> {
+        if self.time_format.is_some() {
+            if self.hex {
+                return Err("电脑时间指令需要使用文本发送");
+            }
+            if !self.content.is_empty() {
+                return Err("电脑时间指令无需填写固定内容");
+            }
+            return Ok(());
+        }
         if self.content.contains('\0') {
             return Err("指令含有 NUL 字符，发送 00 字节请使用 HEX 模式");
         }

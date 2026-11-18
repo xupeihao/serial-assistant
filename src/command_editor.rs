@@ -1,10 +1,12 @@
-use crate::presets::{Ending, Preset, Presets};
+use crate::presets::{Ending, Preset, Presets, TimeFormat};
+use crate::serial_io;
 use crate::window::wide;
 use std::io;
 use std::ptr::null;
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::{
-    COLOR_3DFACE, GetSysColorBrush, HDC, SetBkMode, SetTextColor, TRANSPARENT,
+    COLOR_3DFACE, COLOR_GRAYTEXT, GetSysColor, GetSysColorBrush, HDC, SetBkMode, SetTextColor,
+    TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::EM_SETLIMITTEXT;
@@ -20,6 +22,9 @@ const ENDING: i32 = 114;
 const CONTENT: i32 = 115;
 const STATUS: i32 = 116;
 const DELETE: usize = 117;
+const TIME_FORMAT: i32 = 118;
+const TIME_LABEL: i32 = 119;
+const TIME_PREVIEW: i32 = 120;
 
 pub struct EditResult {
     pub presets: Presets,
@@ -77,21 +82,45 @@ fn fill<'a>(dialog: HWND, id: i32, choices: impl IntoIterator<Item = &'a str>) {
     }
 }
 
-fn update_ending(dialog: HWND) {
+fn update_mode(dialog: HWND) {
+    let mode = select(dialog, MODE);
+    let time = mode == 2;
     unsafe {
-        EnableWindow(
-            GetDlgItem(dialog, ENDING),
-            i32::from(select(dialog, MODE) == 0),
-        )
+        EnableWindow(GetDlgItem(dialog, ENDING), i32::from(mode != 1));
+        ShowWindow(
+            GetDlgItem(dialog, CONTENT),
+            if time { SW_HIDE } else { SW_SHOW },
+        );
+        for id in [TIME_FORMAT, TIME_LABEL, TIME_PREVIEW] {
+            ShowWindow(GetDlgItem(dialog, id), if time { SW_SHOW } else { SW_HIDE });
+        }
     };
+    update_preview(dialog);
+}
+
+fn update_preview(dialog: HWND) {
+    if select(dialog, MODE) == 2 {
+        let format = TimeFormat::OPTIONS[select(dialog, TIME_FORMAT)];
+        set(
+            dialog,
+            TIME_PREVIEW,
+            &format.render(serial_io::local_time()),
+        );
+    }
 }
 
 fn read_preset(dialog: HWND) -> Preset {
     let hex = select(dialog, MODE) == 1;
+    let time = select(dialog, MODE) == 2;
     Preset {
         name: text(dialog, NAME).trim().to_owned(),
-        content: text(dialog, CONTENT),
+        content: if time {
+            String::new()
+        } else {
+            text(dialog, CONTENT)
+        },
         hex,
+        time_format: time.then(|| TimeFormat::OPTIONS[select(dialog, TIME_FORMAT)]),
         ending: if hex {
             Ending::None
         } else {
@@ -107,7 +136,13 @@ fn check_input(dialog: HWND) {
     set(
         dialog,
         STATUS,
-        if show_error { error.unwrap_or("") } else { "" },
+        if let Some(error) = error.filter(|_| show_error) {
+            error
+        } else if preset.time_format.is_some() {
+            "点击快捷按钮时，自动发送电脑当前本地时间"
+        } else {
+            ""
+        },
     );
     let valid = error.is_none() && !preset.name.is_empty();
     unsafe { EnableWindow(GetDlgItem(dialog, IDOK), i32::from(valid)) };
@@ -115,8 +150,9 @@ fn check_input(dialog: HWND) {
 
 impl Editor {
     fn init(&self, dialog: HWND) {
-        fill(dialog, MODE, ["文本", "HEX"]);
+        fill(dialog, MODE, ["文本", "HEX", "电脑时间"]);
         fill(dialog, ENDING, Ending::LABELS);
+        fill(dialog, TIME_FORMAT, TimeFormat::LABELS);
         let profile = &self.presets.profiles[self.presets.selected];
         fill(
             dialog,
@@ -136,6 +172,7 @@ impl Editor {
             }
         }
         self.load(dialog);
+        unsafe { SetTimer(dialog, 1, 500, None) };
     }
 
     fn load(&self, dialog: HWND) {
@@ -156,12 +193,25 @@ impl Editor {
                 dialog,
                 MODE,
                 CB_SETCURSEL,
-                usize::from(preset.is_some_and(|p| p.hex)),
+                if preset.is_some_and(|p| p.time_format.is_some()) {
+                    2
+                } else {
+                    usize::from(preset.is_some_and(|p| p.hex))
+                },
                 0,
             );
             SendDlgItemMessageW(dialog, ENDING, CB_SETCURSEL, ending, 0);
+            let format = preset
+                .and_then(|p| p.time_format)
+                .and_then(|format| {
+                    TimeFormat::OPTIONS
+                        .iter()
+                        .position(|&value| value == format)
+                })
+                .unwrap_or(0);
+            SendDlgItemMessageW(dialog, TIME_FORMAT, CB_SETCURSEL, format, 0);
         }
-        update_ending(dialog);
+        update_mode(dialog);
         check_input(dialog);
     }
 
@@ -222,7 +272,15 @@ unsafe extern "system" fn dialog_proc(
 ) -> isize {
     if msg == WM_CTLCOLORSTATIC && lparam as HWND == unsafe { GetDlgItem(dialog, STATUS) } {
         unsafe {
-            SetTextColor(wparam as HDC, 0x0021_21b5);
+            let info = read_preset(dialog).time_format.is_some();
+            SetTextColor(
+                wparam as HDC,
+                if info {
+                    GetSysColor(COLOR_GRAYTEXT)
+                } else {
+                    0x0021_21b5
+                },
+            );
             SetBkMode(wparam as HDC, TRANSPARENT as i32);
             return GetSysColorBrush(COLOR_3DFACE) as isize;
         }
@@ -236,13 +294,30 @@ unsafe extern "system" fn dialog_proc(
         }
         return 0;
     }
+    if msg == WM_TIMER && wparam == 1 {
+        update_preview(dialog);
+        return 1;
+    }
     if msg == WM_COMMAND {
         let id = wparam & 0xffff;
         let notice = (wparam >> 16) as u32 & 0xffff;
         if ((id == NAME as usize || id == CONTENT as usize) && notice == EN_CHANGE)
-            || ((id == MODE as usize || id == ENDING as usize) && notice == CBN_SELCHANGE)
+            || ((id == MODE as usize || id == ENDING as usize || id == TIME_FORMAT as usize)
+                && notice == CBN_SELCHANGE)
         {
-            update_ending(dialog);
+            if id == MODE as usize && notice == CBN_SELCHANGE {
+                if select(dialog, MODE) == 2 {
+                    if text(dialog, NAME).trim().is_empty() {
+                        set(dialog, NAME, "RTC对时");
+                    }
+                    if select(dialog, ENDING) == 0 {
+                        unsafe { SendDlgItemMessageW(dialog, ENDING, CB_SETCURSEL, 1, 0) };
+                    }
+                }
+                update_mode(dialog);
+            } else if id == TIME_FORMAT as usize {
+                update_preview(dialog);
+            }
             check_input(dialog);
             return 1;
         }

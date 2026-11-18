@@ -1086,7 +1086,17 @@ impl App {
     fn send_preset(&mut self) {
         let command = self.control.as_ref().and_then(ControlWindow::take_send);
         if let Some(command) = command {
-            self.send_command(&command.content, command.hex, command.ending.text());
+            if let Some(format) = command.time_format {
+                self.queue_send(
+                    Command::SendTime {
+                        format,
+                        ending: command.ending,
+                    },
+                    format.byte_len(command.ending),
+                );
+            } else {
+                self.send_command(&command.content, command.hex, command.ending.text());
+            }
         }
     }
 
@@ -1220,13 +1230,20 @@ impl App {
                 return;
             }
         };
+        let length = data.len();
+        self.queue_send(Command::Send(data), length);
+    }
+
+    fn queue_send(&mut self, command: Command, length: usize) {
+        if !self.connected || self.pending_send.is_some() || self.upgrading {
+            return;
+        }
         if let Some(commands) = self
             .session
             .as_ref()
             .and_then(|session| session.commands.as_ref())
         {
-            let length = data.len();
-            if commands.try_send(Command::Send(data)).is_ok() {
+            if commands.try_send(command).is_ok() {
                 self.pending_send = Some(length);
                 self.update_controls();
                 self.status(&format!(
@@ -2394,12 +2411,14 @@ mod tests {
         presets.profiles[0].commands = vec![
             crate::presets::Preset {
                 name: "文本".into(),
+                time_format: None,
                 content: "AT?".into(),
                 hex: false,
                 ending: crate::presets::Ending::CrLf,
             },
             crate::presets::Preset {
                 name: "HEX".into(),
+                time_format: None,
                 content: "A1 B2 00".into(),
                 hex: true,
                 ending: crate::presets::Ending::None,
