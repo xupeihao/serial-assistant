@@ -19,7 +19,7 @@ use windows_sys::w;
 pub const SEND_MESSAGE: u32 = WM_APP + 1;
 const CLASS: windows_sys::core::PCWSTR = w!("RustSerialAssistantControl");
 const TITLE: windows_sys::core::PCWSTR = w!("拓展 · 控制");
-const STYLE: u32 = WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_CLIPCHILDREN;
+const STYLE: u32 = WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_CLIPCHILDREN | WS_MINIMIZEBOX;
 const EX_STYLE: u32 = WS_EX_CONTROLPARENT | WS_EX_COMPOSITED;
 const GRID_TOP: i32 = 124;
 const ROW_HEIGHT: i32 = 40;
@@ -151,7 +151,14 @@ impl ControlWindow {
     pub fn show(&self) {
         let hwnd = self.hwnd();
         unsafe {
-            ShowWindow(hwnd, SW_SHOW);
+            ShowWindow(
+                hwnd,
+                if IsIconic(hwnd) != 0 {
+                    SW_RESTORE
+                } else {
+                    SW_SHOW
+                },
+            );
             SetForegroundWindow(hwnd);
         }
     }

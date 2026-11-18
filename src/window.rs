@@ -28,8 +28,67 @@ use windows_sys::w;
 const TITLE: windows_sys::core::PCWSTR = w!("串口助手");
 const CLASS_NAME: windows_sys::core::PCWSTR = w!("RustSerialAssistant");
 const POLL_TIMER: usize = 1;
-const MENU_CONTROL: usize = 401;
-const MENU_UPGRADE: usize = 402;
+const MENU_EXTENSION_BASE: usize = 401;
+const TOGGLE_EXTENSION_BASE: usize = 501;
+
+#[derive(Clone, Copy)]
+enum Extension {
+    Control,
+    Upgrade,
+}
+
+// Menu order also assigns Alt+1 through Alt+9 to registered extensions.
+const EXTENSIONS: &[Extension] = &[Extension::Control, Extension::Upgrade];
+
+impl Extension {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Control => "控制",
+            Self::Upgrade => "N6 串口升级",
+        }
+    }
+}
+
+struct ExtensionShortcuts(HACCEL);
+
+impl ExtensionShortcuts {
+    fn new() -> io::Result<Self> {
+        let keys: Vec<_> = (0..9u16)
+            .flat_map(|index| {
+                [b'1' as u16 + index, VK_NUMPAD1 + index].map(|key| ACCEL {
+                    fVirt: FALT | FVIRTKEY,
+                    key,
+                    cmd: (TOGGLE_EXTENSION_BASE + index as usize) as u16,
+                })
+            })
+            .collect();
+        let table = unsafe { CreateAcceleratorTableW(keys.as_ptr(), keys.len() as i32) };
+        if table.is_null() {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(Self(table))
+        }
+    }
+
+    fn translate(&self, window: HWND, msg: &MSG) -> bool {
+        let number = (b'1' as usize..=b'9' as usize).contains(&msg.wParam)
+            || (VK_NUMPAD1 as usize..=VK_NUMPAD9 as usize).contains(&msg.wParam);
+        if msg.message == WM_SYSKEYDOWN
+            && msg.lParam & (1 << 30) != 0
+            && number
+            && unsafe { GetKeyState(VK_CONTROL as i32) >= 0 && GetKeyState(VK_SHIFT as i32) >= 0 }
+        {
+            return true;
+        }
+        unsafe { TranslateAcceleratorW(window, self.0, msg) != 0 }
+    }
+}
+
+impl Drop for ExtensionShortcuts {
+    fn drop(&mut self) {
+        unsafe { DestroyAcceleratorTable(self.0) };
+    }
+}
 const HISTORY_LIMIT: usize = 96 * 1024;
 const HISTORY_RETAIN: usize = 64 * 1024;
 const HISTORY_BATCH_LIMIT: usize = 4096;
@@ -942,6 +1001,88 @@ impl App {
         control.show();
     }
 
+    fn extension_window(&self, extension: Extension) -> Option<HWND> {
+        match extension {
+            Extension::Control => self.control.as_ref().map(ControlWindow::hwnd),
+            Extension::Upgrade => self.upgrade.as_ref().map(UpgradeWindow::hwnd),
+        }
+    }
+
+    fn show_extension(&mut self, extension: Extension) {
+        match extension {
+            Extension::Control => self.show_control(),
+            Extension::Upgrade => self.show_upgrade(),
+        }
+    }
+
+    fn toggle_extension(&mut self, extension: Extension) {
+        if let Some(window) = self.extension_window(extension)
+            && unsafe { IsWindowVisible(window) != 0 && IsIconic(window) == 0 }
+        {
+            unsafe {
+                ShowWindow(window, SW_MINIMIZE);
+                SetForegroundWindow(self.ui.window);
+                SetFocus(self.ui.handle(Id::SendText));
+            }
+        } else {
+            self.show_extension(extension);
+        }
+    }
+
+    fn dialog_for_message(&self, window: HWND) -> Option<HWND> {
+        EXTENSIONS
+            .iter()
+            .find_map(|&extension| {
+                self.extension_window(extension)
+                    .filter(|&dialog| dialog == window || unsafe { IsChild(dialog, window) != 0 })
+            })
+            .or_else(|| {
+                (window == self.ui.window || unsafe { IsChild(self.ui.window, window) != 0 })
+                    .then_some(self.ui.window)
+            })
+    }
+
+    fn minimize_main_shortcut(&self, msg: &MSG) -> bool {
+        if msg.message != WM_KEYDOWN || msg.wParam != VK_ESCAPE as usize {
+            return false;
+        }
+        let Some(dialog) = self.dialog_for_message(msg.hwnd) else {
+            return false;
+        };
+        let down = |key| unsafe { GetKeyState(key as i32) < 0 };
+        let (alt, ctrl, shift) = (down(VK_MENU), down(VK_CONTROL), down(VK_SHIFT));
+        let repeated = msg.lParam & (1 << 30) != 0;
+        if msg.wParam == VK_ESCAPE as usize && !alt && !ctrl && !shift && dialog == self.ui.window {
+            let extension_visible = EXTENSIONS.iter().any(|&extension| {
+                self.extension_window(extension)
+                    .is_some_and(|window| unsafe {
+                        IsWindowVisible(window) != 0 && IsIconic(window) == 0
+                    })
+            });
+            let dropdown_open = [
+                Id::Encoding,
+                Id::LogFont,
+                Id::LogFontSize,
+                Id::Port,
+                Id::Baud,
+                Id::DataBits,
+                Id::Parity,
+                Id::StopBits,
+                Id::Flow,
+                Id::Ending,
+            ]
+            .into_iter()
+            .any(|id| self.ui.message(id, CB_GETDROPPEDSTATE, 0, 0) != 0);
+            if !extension_visible && !dropdown_open {
+                if !repeated {
+                    unsafe { ShowWindow(self.ui.window, SW_MINIMIZE) };
+                }
+                return true;
+            }
+        }
+        false
+    }
+
     fn send_preset(&mut self) {
         let command = self.control.as_ref().and_then(ControlWindow::take_send);
         if let Some(command) = command {
@@ -1303,11 +1444,21 @@ impl App {
     }
 
     fn command(&mut self, id: usize, notification: u32) {
-        if notification == BN_CLICKED {
+        if notification == 1 && (TOGGLE_EXTENSION_BASE..TOGGLE_EXTENSION_BASE + 9).contains(&id) {
+            if let Some(&extension) = EXTENSIONS.get(id - TOGGLE_EXTENSION_BASE) {
+                self.toggle_extension(extension);
+            }
+        } else if notification == BN_CLICKED {
+            if let Some(extension) = id
+                .checked_sub(MENU_EXTENSION_BASE)
+                .and_then(|index| EXTENSIONS.get(index))
+                .copied()
+            {
+                self.show_extension(extension);
+                return;
+            }
             match id {
                 x if x == Id::Connect as usize => self.toggle(),
-                MENU_CONTROL => self.show_control(),
-                MENU_UPGRADE => self.show_upgrade(),
                 x if x == Id::Refresh as usize => self.refresh_ports(),
                 x if x == Id::Send as usize => self.send(),
                 x if x == Id::ClearRx as usize => self.clear_receive(),
@@ -1443,6 +1594,7 @@ impl LogEntry {
 pub fn run() -> io::Result<()> {
     unsafe {
         SetProcessDPIAware();
+        let shortcuts = ExtensionShortcuts::new()?;
         let rich_edit = LoadLibraryW(w!("Msftedit.dll"));
         if rich_edit.is_null() {
             return Err(io::Error::last_os_error());
@@ -1485,10 +1637,11 @@ pub fn run() -> io::Result<()> {
         } else {
             (CW_USEDEFAULT, CW_USEDEFAULT)
         };
+        let window_title = wide(concat!("串口助手 v", env!("CARGO_PKG_VERSION")));
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE,
             CLASS_NAME,
-            TITLE,
+            window_title.as_ptr(),
             WINDOW_STYLE,
             x,
             y,
@@ -1542,6 +1695,13 @@ pub fn run() -> io::Result<()> {
                 0 => return Ok(()),
                 _ => (),
             }
+            if app.borrow().minimize_main_shortcut(&msg) {
+                continue;
+            }
+            let belongs_to_app = app.borrow().dialog_for_message(msg.hwnd).is_some();
+            if belongs_to_app && shortcuts.translate(hwnd, &msg) {
+                continue;
+            }
             if msg.message == WM_KEYDOWN && GetKeyState(VK_CONTROL as i32) < 0 {
                 if msg.hwnd == tx && msg.wParam == VK_RETURN as usize {
                     app.borrow_mut().send();
@@ -1552,17 +1712,7 @@ pub fn run() -> io::Result<()> {
                     continue;
                 }
             }
-            let dialog = {
-                let app = app.borrow();
-                [
-                    app.control.as_ref().map(ControlWindow::hwnd),
-                    app.upgrade.as_ref().map(UpgradeWindow::hwnd),
-                ]
-                .into_iter()
-                .flatten()
-                .find(|&window| window == msg.hwnd || IsChild(window, msg.hwnd) != 0)
-                .unwrap_or(hwnd)
-            };
+            let dialog = app.borrow().dialog_for_message(msg.hwnd).unwrap_or(hwnd);
             if IsDialogMessageW(dialog, &msg) == 0 {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
@@ -1582,9 +1732,20 @@ fn show_extensions(window: HWND) {
         if menu.is_null() {
             return;
         }
-        let command = if AppendMenuW(menu, MF_STRING, MENU_CONTROL, w!("控制")) != 0
-            && AppendMenuW(menu, MF_STRING, MENU_UPGRADE, w!("N6 串口升级")) != 0
-        {
+        let ready = EXTENSIONS.iter().enumerate().all(|(index, &extension)| {
+            let label = if index < 9 {
+                format!("{}\tAlt+{}", extension.name(), index + 1)
+            } else {
+                extension.name().to_string()
+            };
+            AppendMenuW(
+                menu,
+                MF_STRING,
+                MENU_EXTENSION_BASE + index,
+                wide(&label).as_ptr(),
+            ) != 0
+        });
+        let command = if ready {
             TrackPopupMenu(
                 menu,
                 TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
@@ -1915,6 +2076,121 @@ pub fn startup_error(error: &io::Error) {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    #[test]
+    fn native_alt_shortcuts_and_escape_preserve_windows() {
+        unsafe {
+            let instance = GetModuleHandleW(null());
+            let rich_edit = LoadLibraryW(w!("Msftedit.dll"));
+            let class_name = w!("RustSerialAssistantShortcutTest");
+            let class = WNDCLASSW {
+                lpfnWndProc: Some(window_proc),
+                hInstance: instance,
+                lpszClassName: class_name,
+                ..Default::default()
+            };
+            assert_ne!(RegisterClassW(&class), 0);
+            let host = CreateWindowExW(
+                0,
+                class_name,
+                w!("Shortcut test"),
+                WINDOW_STYLE,
+                0,
+                0,
+                940,
+                610,
+                null_mut(),
+                null_mut(),
+                instance,
+                null(),
+            );
+            assert!(!host.is_null() && !rich_edit.is_null());
+            let app = RefCell::new(App::new(
+                Ui::new(host, instance, 96).unwrap(),
+                Preferences::default(),
+            ));
+            SetWindowLongPtrW(host, GWLP_USERDATA, &raw const app as isize);
+            let shortcuts = ExtensionShortcuts::new().unwrap();
+            let mut previous = [0; 256];
+            assert_ne!(GetKeyboardState(previous.as_mut_ptr()), 0);
+            let key = |target, digit, repeat, alt| {
+                let mut keyboard = [0; 256];
+                keyboard[if alt { VK_MENU } else { VK_CONTROL } as usize] = 0x80;
+                assert_ne!(SetKeyboardState(keyboard.as_ptr()), 0);
+                let message = MSG {
+                    hwnd: target,
+                    message: if alt { WM_SYSKEYDOWN } else { WM_KEYDOWN },
+                    wParam: digit as usize,
+                    lParam: 1 | if alt { 1 << 29 } else { 0 } | if repeat { 1 << 30 } else { 0 },
+                    ..Default::default()
+                };
+                shortcuts.translate(host, &message)
+            };
+            let main_input = app.borrow().ui.handle(Id::SendText);
+            assert!(!key(main_input, b'1', false, false));
+            assert!(key(main_input, b'3', false, true));
+            assert!(app.borrow().control.is_none() && app.borrow().upgrade.is_none());
+            assert!(key(main_input, b'1', false, true));
+            let control = app.borrow().control.as_ref().unwrap().hwnd();
+            let control_input = GetDlgItem(control, 102);
+            SetWindowTextW(control_input, w!("preserve edited name"));
+            assert!(IsWindowVisible(control) != 0 && IsIconic(control) == 0);
+            assert!(key(control_input, b'1', false, true));
+            assert_ne!(IsIconic(control), 0);
+            assert!(key(main_input, b'1', true, true));
+            assert_ne!(IsIconic(control), 0);
+            assert!(key(main_input, b'1', false, true));
+            assert_eq!(IsIconic(control), 0);
+            assert_eq!(app.borrow().control.as_ref().unwrap().hwnd(), control);
+            let mut text = [0; 64];
+            let len = GetWindowTextW(control_input, text.as_mut_ptr(), text.len() as i32);
+            assert_eq!(
+                String::from_utf16_lossy(&text[..len as usize]),
+                "preserve edited name"
+            );
+            assert!(key(control_input, b'2', false, true));
+            let upgrade = app.borrow().upgrade.as_ref().unwrap().hwnd();
+            let upgrade_input = GetDlgItem(upgrade, 106);
+            SetWindowTextW(upgrade_input, w!("firmware.bin"));
+            assert!(key(upgrade_input, b'2', false, true));
+            assert_ne!(IsIconic(upgrade), 0);
+            assert!(key(main_input, b'2', false, true));
+            assert_eq!(IsIconic(upgrade), 0);
+            let len = GetWindowTextW(upgrade_input, text.as_mut_ptr(), text.len() as i32);
+            assert_eq!(
+                String::from_utf16_lossy(&text[..len as usize]),
+                "firmware.bin"
+            );
+            assert_ne!(SetKeyboardState([0; 256].as_ptr()), 0);
+            let escape = MSG {
+                hwnd: main_input,
+                message: WM_KEYDOWN,
+                wParam: VK_ESCAPE as usize,
+                ..Default::default()
+            };
+            assert!(!app.borrow().minimize_main_shortcut(&escape));
+            assert!(key(upgrade_input, b'1', false, true));
+            assert!(key(main_input, b'2', false, true));
+            assert_ne!(SetKeyboardState([0; 256].as_ptr()), 0);
+            assert!(app.borrow().minimize_main_shortcut(&escape));
+            assert_ne!(IsIconic(host), 0);
+            assert_ne!(IsWindow(host), 0);
+            ShowWindow(host, SW_RESTORE);
+            SendMessageW(control, WM_CLOSE, 0, 0);
+            SendMessageW(upgrade, WM_CLOSE, 0, 0);
+            assert!(key(main_input, b'1', false, true));
+            assert_eq!(app.borrow().control.as_ref().unwrap().hwnd(), control);
+            SendMessageW(control, WM_CLOSE, 0, 0);
+            assert_ne!(SetKeyboardState([0; 256].as_ptr()), 0);
+            assert!(app.borrow().minimize_main_shortcut(&escape));
+            assert_ne!(IsIconic(host), 0);
+            assert_ne!(IsWindow(host), 0);
+            SetKeyboardState(previous.as_ptr());
+            DestroyWindow(host);
+            UnregisterClassW(class_name, instance);
+            FreeLibrary(rich_edit);
+        }
+    }
 
     #[test]
     fn native_controls_send_and_display_a_simulated_echo() {

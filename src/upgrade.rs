@@ -53,9 +53,17 @@ impl UpgradeWindow {
     }
 
     pub fn show(&self) {
+        let hwnd = self.hwnd();
         unsafe {
-            ShowWindow(self.hwnd(), SW_SHOW);
-            SetForegroundWindow(self.hwnd());
+            ShowWindow(
+                hwnd,
+                if IsIconic(hwnd) != 0 {
+                    SW_RESTORE
+                } else {
+                    SW_SHOW
+                },
+            );
+            SetForegroundWindow(hwnd);
         }
     }
 
