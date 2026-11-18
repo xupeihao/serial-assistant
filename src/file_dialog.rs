@@ -33,6 +33,17 @@ pub fn open_json(owner: HWND) -> io::Result<Option<PathBuf>> {
     )
 }
 
+pub fn open_firmware(owner: HWND) -> io::Result<Option<PathBuf>> {
+    choose_path(
+        owner,
+        "选择 N6 trusted.bin 镜像",
+        "",
+        "STM32 固件 (*.bin)",
+        "bin",
+        false,
+    )
+}
+
 fn choose_path(
     owner: HWND,
     title: &str,

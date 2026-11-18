@@ -3,6 +3,7 @@ use crate::control::{self, ControlWindow};
 use crate::file_dialog;
 use crate::preferences::{LOG_FONT_COUNT, LOG_FONT_SIZES, Preferences};
 use crate::serial_io::{self, Connection, Event, Packet, Settings};
+use crate::upgrade::UpgradeWindow;
 use crate::window_layout::WindowLayout;
 use encoding_rs::{Encoding, GBK, UTF_8};
 use serialport::{DataBits, FlowControl, Parity, StopBits};
@@ -27,6 +28,7 @@ const TITLE: windows_sys::core::PCWSTR = w!("串口助手");
 const CLASS_NAME: windows_sys::core::PCWSTR = w!("RustSerialAssistant");
 const POLL_TIMER: usize = 1;
 const MENU_CONTROL: usize = 401;
+const MENU_UPGRADE: usize = 402;
 const HISTORY_LIMIT: usize = 96 * 1024;
 const HISTORY_RETAIN: usize = 64 * 1024;
 const HISTORY_BATCH_LIMIT: usize = 4096;
@@ -765,6 +767,7 @@ impl Drop for Ui {
 struct App {
     ui: Ui,
     control: Option<ControlWindow>,
+    upgrade: Option<UpgradeWindow>,
     session: Option<Connection>,
     connected: bool,
     pending_send: Option<usize>,
@@ -784,6 +787,7 @@ impl App {
         let app = Self {
             ui,
             control: None,
+            upgrade: None,
             session: None,
             connected: false,
             pending_send: None,
@@ -925,6 +929,19 @@ impl App {
         if let Some(command) = command {
             self.send_command(&command.content, command.hex, command.ending.text());
         }
+    }
+
+    fn show_upgrade(&mut self) {
+        if self.upgrade.is_none() {
+            match UpgradeWindow::create(self.ui.window) {
+                Ok(upgrade) => self.upgrade = Some(upgrade),
+                Err(error) => {
+                    self.status(&format!("无法打开 N6 升级窗口 · {error}"));
+                    return;
+                }
+            }
+        }
+        self.upgrade.as_ref().unwrap().show();
     }
 
     fn toggle(&mut self) {
@@ -1191,6 +1208,7 @@ impl App {
             match id {
                 x if x == Id::Connect as usize => self.toggle(),
                 MENU_CONTROL => self.show_control(),
+                MENU_UPGRADE => self.show_upgrade(),
                 x if x == Id::Refresh as usize => self.refresh_ports(),
                 x if x == Id::Send as usize => self.send(),
                 x if x == Id::ClearRx as usize => self.clear_receive(),
@@ -1416,13 +1434,17 @@ pub fn run() -> io::Result<()> {
                     continue;
                 }
             }
-            let dialog = app
-                .borrow()
-                .control
-                .as_ref()
-                .map(ControlWindow::hwnd)
-                .filter(|&control| control == msg.hwnd || IsChild(control, msg.hwnd) != 0)
-                .unwrap_or(hwnd);
+            let dialog = {
+                let app = app.borrow();
+                [
+                    app.control.as_ref().map(ControlWindow::hwnd),
+                    app.upgrade.as_ref().map(UpgradeWindow::hwnd),
+                ]
+                .into_iter()
+                .flatten()
+                .find(|&window| window == msg.hwnd || IsChild(window, msg.hwnd) != 0)
+                .unwrap_or(hwnd)
+            };
             if IsDialogMessageW(dialog, &msg) == 0 {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
@@ -1442,7 +1464,9 @@ fn show_extensions(window: HWND) {
         if menu.is_null() {
             return;
         }
-        let command = if AppendMenuW(menu, MF_STRING, MENU_CONTROL, w!("控制")) != 0 {
+        let command = if AppendMenuW(menu, MF_STRING, MENU_CONTROL, w!("控制")) != 0
+            && AppendMenuW(menu, MF_STRING, MENU_UPGRADE, w!("N6 串口升级")) != 0
+        {
             TrackPopupMenu(
                 menu,
                 TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
@@ -1525,6 +1549,7 @@ unsafe extern "system" fn window_proc(
                 && let Ok(mut app) = state.try_borrow_mut()
             {
                 app.control.take();
+                app.upgrade.take();
             }
             unsafe {
                 KillTimer(hwnd, POLL_TIMER);
@@ -1549,6 +1574,16 @@ unsafe extern "system" fn window_proc(
         }
         WM_CLOSE => {
             let state = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const RefCell<App>;
+            if let Some(state) = unsafe { state.as_ref() } {
+                let upgrade = state.borrow();
+                if upgrade
+                    .upgrade
+                    .as_ref()
+                    .is_some_and(|ui| !ui.request_close())
+                {
+                    return 0;
+                }
+            }
             if let Some(state) = unsafe { state.as_ref() }
                 && let Ok(mut app) = state.try_borrow_mut()
                 && let Err(error) = app.save_preferences()

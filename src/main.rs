@@ -7,6 +7,8 @@ mod file_dialog;
 mod preferences;
 mod presets;
 mod serial_io;
+mod upgrade;
+mod upgrade_protocol;
 mod window;
 mod window_layout;
 
