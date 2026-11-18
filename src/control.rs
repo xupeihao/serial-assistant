@@ -694,6 +694,10 @@ unsafe extern "system" fn window_proc(
             unsafe { ShowWindow(hwnd, SW_HIDE) };
             return 0;
         }
+        WM_COMMAND if wparam == IDCANCEL as usize => {
+            unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
+            return 0;
+        }
         WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
             unsafe { SetBkColor(wparam as HDC, GetSysColor(COLOR_WINDOW)) };
             return unsafe { GetSysColorBrush(COLOR_WINDOW) } as LRESULT;
