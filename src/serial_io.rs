@@ -2,6 +2,7 @@ use crate::presets::{Ending, TimeFormat};
 use crate::upgrade_protocol::{self, Protocol, Request};
 use serialport::{DataBits, FlowControl, Parity, SerialPort, StopBits};
 use std::io::{self, ErrorKind, Read, Write};
+use std::net::SocketAddr;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::SYSTEMTIME;
@@ -23,6 +24,11 @@ pub struct Settings {
 
 pub enum Event {
     Opened,
+    NetworkState {
+        ready: bool,
+        description: String,
+        reset: bool,
+    },
     Received(Vec<Packet>),
     Sent {
         packet: Packet,
@@ -42,16 +48,17 @@ pub enum Command {
 pub struct Packet {
     pub time: SYSTEMTIME,
     pub bytes: Vec<u8>,
+    pub peer: Option<SocketAddr>,
 }
 
 #[derive(Default)]
-struct ReceiveRecords {
+pub(crate) struct ReceiveRecords {
     pending: Option<Packet>,
     last_read: Option<Instant>,
 }
 
 impl ReceiveRecords {
-    fn take_if_idle(&mut self, now: Instant) -> Option<Packet> {
+    pub(crate) fn take_if_idle(&mut self, now: Instant) -> Option<Packet> {
         if self
             .last_read
             .is_some_and(|last| now.duration_since(last) >= RECEIVE_IDLE)
@@ -62,7 +69,7 @@ impl ReceiveRecords {
         }
     }
 
-    fn push(&mut self, bytes: &[u8], now: Instant, time: SYSTEMTIME) -> Vec<Packet> {
+    pub(crate) fn push(&mut self, bytes: &[u8], now: Instant, time: SYSTEMTIME) -> Vec<Packet> {
         let mut records = Vec::new();
         records.extend(self.take_if_idle(now));
         for &byte in bytes {
@@ -78,6 +85,7 @@ impl ReceiveRecords {
             let record = self.pending.get_or_insert_with(|| Packet {
                 time,
                 bytes: Vec::new(),
+                peer: None,
             });
             record.bytes.push(byte);
             if byte == b'\n' || (record.bytes.len() >= MAX_RECEIVE_RECORD && byte != b'\r') {
@@ -86,6 +94,10 @@ impl ReceiveRecords {
         }
         self.last_read = Some(now);
         records
+    }
+
+    pub(crate) fn finish(&mut self) -> Vec<Packet> {
+        self.pending.take().into_iter().collect()
     }
 }
 
@@ -230,6 +242,7 @@ fn report_send(
         packet: Packet {
             time: local_time(),
             bytes,
+            peer: None,
         },
         requested,
         error,

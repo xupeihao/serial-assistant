@@ -4,6 +4,7 @@ mod codec;
 mod command_editor;
 mod control;
 mod file_dialog;
+mod network_io;
 mod preferences;
 mod presets;
 mod serial_io;

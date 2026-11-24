@@ -1,6 +1,7 @@
 use crate::codec::{self, ReceiveFormat};
 use crate::control::{self, ControlWindow};
 use crate::file_dialog;
+use crate::network_io::{self, Mode};
 use crate::preferences::{LOG_FONT_COUNT, LOG_FONT_SIZES, Preferences};
 use crate::serial_io::{self, Command, Connection, Event, Packet, Settings};
 use crate::upgrade::{self, UpgradeWindow};
@@ -128,7 +129,7 @@ const RECEIVE_TOP: i32 = 42;
 const MIN_RECEIVE_HEIGHT: i32 = 95;
 const MIN_SERIAL_WIDTH: i32 = 306;
 const MIN_SEND_WIDTH: i32 = 388;
-const MIN_LOWER_HEIGHT: i32 = 155;
+const MIN_LOWER_HEIGHT: i32 = 185;
 const FOOTER_HEIGHT: i32 = 37;
 const MIN_CLIENT_WIDTH: i32 = 936;
 const WORKSPACE_COLOR: COLORREF = 0x00f7_f5f3;
@@ -280,10 +281,21 @@ enum Id {
     LogFontSize,
     Extensions,
     SaveLog,
+    ConnectionModeLabel,
+    ConnectionMode,
+    RemoteHostLabel,
+    RemoteHost,
+    RemotePortLabel,
+    RemotePort,
+    LocalHostLabel,
+    LocalHost,
+    LocalPortLabel,
+    LocalPort,
+    NetworkHint,
 }
 
 impl Id {
-    const COUNT: usize = Self::SaveLog as usize - Self::ReceiveLabel as usize + 1;
+    const COUNT: usize = Self::NetworkHint as usize - Self::ReceiveLabel as usize + 1;
 
     fn index(self) -> usize {
         self as usize - Self::ReceiveLabel as usize
@@ -300,6 +312,7 @@ enum Kind {
     List,
     EditableList,
     Input,
+    SingleInput,
     Log,
 }
 
@@ -334,7 +347,18 @@ impl Ui {
             (SaveLog, Button, "保存记录"),
             (ClearRx, Button, "清空记录"),
             (Receive, Log, ""),
-            (SerialGroup, Label, "串口设置"),
+            (SerialGroup, Label, "连接设置"),
+            (ConnectionModeLabel, Label, "类型"),
+            (ConnectionMode, List, ""),
+            (RemoteHostLabel, Label, "远端IP"),
+            (RemoteHost, SingleInput, ""),
+            (RemotePortLabel, Label, "远端口"),
+            (RemotePort, SingleInput, ""),
+            (LocalHostLabel, Label, "本地IP"),
+            (LocalHost, SingleInput, ""),
+            (LocalPortLabel, Label, "本地口"),
+            (LocalPort, SingleInput, ""),
+            (NetworkHint, Label, ""),
             (PortLabel, Label, "端口"),
             (Port, List, ""),
             (Refresh, Button, "刷新"),
@@ -366,7 +390,7 @@ impl Ui {
             font: make_font("Microsoft YaHei UI", dpi),
             mono_font: make_font("Consolas", dpi),
             serial_width: 330,
-            lower_height: 180,
+            lower_height: 210,
             drag: None,
             child_layout: WindowLayout::default(),
             drawn_layout: Cell::new(None),
@@ -400,6 +424,11 @@ impl Ui {
                         | WS_VSCROLL
                         | WS_BORDER
                         | (ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN) as u32,
+                ),
+                SingleInput => (
+                    w!("EDIT"),
+                    WS_EX_CLIENTEDGE,
+                    WS_TABSTOP | ES_AUTOHSCROLL as u32,
                 ),
                 Log => (
                     w!("RICHEDIT50W"),
@@ -442,12 +471,19 @@ impl Ui {
             Receive,
             EM_EXLIMITTEXT,
             0,
-            (HISTORY_LIMIT * 4 + HISTORY_BATCH_LIMIT * 40) as isize,
+            (HISTORY_LIMIT * 4 + HISTORY_BATCH_LIMIT * 128) as isize,
         );
         ui.message(Receive, EM_SETBKGNDCOLOR, 0, 0x00ff_ffff);
         ui.message(SendText, EM_SETLIMITTEXT, 65536, 0);
         ui.message(Follow, BM_SETCHECK, BST_CHECKED as usize, 0);
         ui.fill(Encoding, &["UTF-8", "GBK"], Some(0));
+        ui.fill(ConnectionMode, &Mode::LABELS, Some(0));
+        for id in [RemoteHost, LocalHost] {
+            ui.message(id, EM_SETLIMITTEXT, 64, 0);
+        }
+        for id in [RemotePort, LocalPort] {
+            ui.message(id, EM_SETLIMITTEXT, 5, 0);
+        }
         ui.fill(
             Baud,
             &[
@@ -543,6 +579,15 @@ impl Ui {
         unsafe { EnableWindow(self.handle(id), i32::from(enabled)) };
     }
 
+    fn show(&self, id: Id, visible: bool) {
+        let window = self.handle(id);
+        unsafe {
+            if (GetWindowLongPtrW(window, GWL_STYLE) as u32 & WS_VISIBLE != 0) != visible {
+                ShowWindow(window, if visible { SW_SHOW } else { SW_HIDE });
+            }
+        }
+    }
+
     fn panes(&self) -> PaneLayout {
         let mut rect = RECT::default();
         unsafe { GetClientRect(self.window, &mut rect) };
@@ -600,35 +645,52 @@ impl Ui {
                 bottom - DIVIDER_SIZE - RECEIVE_TOP,
             ),
             (SerialGroup, 29, bottom + 2, serial_width - 26, 19),
-            (PortLabel, 29, bottom + 22, 50, 25),
-            (Port, 81, bottom + 22, serial_right - 161, 200),
-            (Refresh, serial_right - 72, bottom + 22, 72, 25),
-            (BaudLabel, 29, bottom + 52, 50, 25),
-            (Baud, 81, bottom + 52, field_width, 225),
-            (DataLabel, right_column, bottom + 52, 50, 25),
+            (ConnectionModeLabel, 29, bottom + 22, 50, 25),
+            (ConnectionMode, 81, bottom + 22, serial_right - 81, 190),
+            (RemoteHostLabel, 29, bottom + 52, 50, 25),
+            (RemoteHost, 81, bottom + 52, serial_right - 81, 25),
+            (RemotePortLabel, 29, bottom + 82, 50, 25),
+            (RemotePort, 81, bottom + 82, field_width, 25),
+            (LocalPortLabel, right_column, bottom + 82, 50, 25),
+            (
+                LocalPort,
+                right_column + 52,
+                bottom + 82,
+                serial_right - right_column - 52,
+                25,
+            ),
+            (LocalHostLabel, 29, bottom + 112, 50, 25),
+            (LocalHost, 81, bottom + 112, serial_right - 81, 25),
+            (NetworkHint, 29, bottom + 142, right_column - 37, 25),
+            (PortLabel, 29, bottom + 52, 50, 25),
+            (Port, 81, bottom + 52, serial_right - 161, 200),
+            (Refresh, serial_right - 72, bottom + 52, 72, 25),
+            (BaudLabel, 29, bottom + 82, 50, 25),
+            (Baud, 81, bottom + 82, field_width, 225),
+            (DataLabel, right_column, bottom + 82, 50, 25),
             (
                 DataBits,
-                right_column + 52,
-                bottom + 52,
-                serial_right - right_column - 52,
-                150,
-            ),
-            (ParityLabel, 29, bottom + 82, 50, 25),
-            (Parity, 81, bottom + 82, field_width, 150),
-            (StopLabel, right_column, bottom + 82, 50, 25),
-            (
-                StopBits,
                 right_column + 52,
                 bottom + 82,
                 serial_right - right_column - 52,
                 150,
             ),
-            (FlowLabel, 29, bottom + 112, 50, 25),
-            (Flow, 81, bottom + 112, field_width, 150),
+            (ParityLabel, 29, bottom + 112, 50, 25),
+            (Parity, 81, bottom + 112, field_width, 150),
+            (StopLabel, right_column, bottom + 112, 50, 25),
+            (
+                StopBits,
+                right_column + 52,
+                bottom + 112,
+                serial_right - right_column - 52,
+                150,
+            ),
+            (FlowLabel, 29, bottom + 142, 50, 25),
+            (Flow, 81, bottom + 142, field_width, 150),
             (
                 Connect,
                 right_column,
-                bottom + 110,
+                bottom + 140,
                 serial_right - right_column,
                 29,
             ),
@@ -838,13 +900,24 @@ struct App {
     receive_format: ReceiveFormat,
     first_receive_in_session: bool,
     preferences: Preferences,
+    network_preferences: network_io::Preferences,
     rx: u64,
     tx: u64,
 }
 
 impl App {
-    fn new(ui: Ui, preferences: Preferences) -> Self {
+    fn new(ui: Ui, preferences: Preferences, network_preferences: network_io::Preferences) -> Self {
         ui.init_log_font(&preferences);
+        ui.message(
+            Id::ConnectionMode,
+            CB_SETCURSEL,
+            network_preferences.mode.index(),
+            0,
+        );
+        ui.set_text(Id::RemoteHost, &network_preferences.remote_host);
+        ui.set_text(Id::RemotePort, &network_preferences.remote_port);
+        ui.set_text(Id::LocalHost, &network_preferences.local_host);
+        ui.set_text(Id::LocalPort, &network_preferences.local_port);
         let app = Self {
             ui,
             control: None,
@@ -859,10 +932,15 @@ impl App {
             receive_format: ReceiveFormat::new(false, UTF_8),
             first_receive_in_session: true,
             preferences,
+            network_preferences,
             rx: 0,
             tx: 0,
         };
-        app.refresh_ports();
+        if app.mode() == Mode::Serial {
+            app.refresh_ports();
+        } else {
+            app.status("未连接 · 请设置网络地址和端口");
+        }
         app.update_controls();
         app.update_counter();
         app
@@ -891,7 +969,23 @@ impl App {
         self.preferences.timestamps = self.ui.checked(Id::Timestamps);
         self.preferences.log_font = self.ui.selected(Id::LogFont);
         self.preferences.log_font_size = self.ui.selected(Id::LogFontSize);
-        self.preferences.save()
+        self.network_preferences = self.read_network_preferences();
+        self.preferences.save()?;
+        self.network_preferences.save()
+    }
+
+    fn mode(&self) -> Mode {
+        Mode::ALL[self.ui.selected(Id::ConnectionMode)]
+    }
+
+    fn read_network_preferences(&self) -> network_io::Preferences {
+        network_io::Preferences {
+            mode: self.mode(),
+            remote_host: self.ui.text(Id::RemoteHost),
+            remote_port: self.ui.text(Id::RemotePort),
+            local_host: self.ui.text(Id::LocalHost),
+            local_port: self.ui.text(Id::LocalPort),
+        }
     }
 
     fn encoding(&self) -> &'static Encoding {
@@ -942,6 +1036,53 @@ impl App {
 
     fn update_controls(&self) {
         let idle = self.session.is_none();
+        let mode = self.mode();
+        let serial = mode == Mode::Serial;
+        self.ui.enable(Id::ConnectionMode, idle);
+        for id in [
+            Id::PortLabel,
+            Id::Port,
+            Id::Refresh,
+            Id::BaudLabel,
+            Id::Baud,
+            Id::DataLabel,
+            Id::DataBits,
+            Id::ParityLabel,
+            Id::Parity,
+            Id::StopLabel,
+            Id::StopBits,
+            Id::FlowLabel,
+            Id::Flow,
+        ] {
+            self.ui.show(id, serial);
+        }
+        for id in [
+            Id::RemoteHostLabel,
+            Id::RemoteHost,
+            Id::RemotePortLabel,
+            Id::RemotePort,
+            Id::LocalHostLabel,
+            Id::LocalHost,
+            Id::LocalPortLabel,
+            Id::LocalPort,
+            Id::NetworkHint,
+        ] {
+            self.ui.show(id, !serial);
+        }
+        for id in [Id::RemoteHost, Id::RemotePort] {
+            self.ui.enable(id, idle && mode != Mode::TcpServer);
+        }
+        for id in [Id::LocalHost, Id::LocalPort] {
+            self.ui.enable(id, idle && mode != Mode::TcpClient);
+        }
+        self.ui.set_text(
+            Id::NetworkHint,
+            match mode {
+                Mode::TcpServer => "单客户端监听",
+                Mode::Udp => "按报文收发",
+                _ => "连接远端设备",
+            },
+        );
         for id in [
             Id::Port,
             Id::Baud,
@@ -953,8 +1094,24 @@ impl App {
         ] {
             self.ui.enable(id, idle);
         }
+        let closing = self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.commands.is_none());
         let button = if self.upgrading {
             "升级中…"
+        } else if closing {
+            "请稍候…"
+        } else if !serial {
+            match (mode, idle, self.connected) {
+                (Mode::TcpServer, true, _) => "开始监听",
+                (Mode::TcpServer, false, _) => "停止监听",
+                (Mode::Udp, true, _) => "打开 UDP",
+                (Mode::Udp, false, _) => "关闭 UDP",
+                (_, true, _) => "连接网络",
+                (_, false, false) => "取消连接",
+                _ => "断开连接",
+            }
         } else if idle {
             "打开串口"
         } else if self.connected {
@@ -963,8 +1120,10 @@ impl App {
             "请稍候…"
         };
         self.ui.set_text(Id::Connect, button);
-        self.ui
-            .enable(Id::Connect, !self.upgrading && (idle || self.connected));
+        self.ui.enable(
+            Id::Connect,
+            !self.upgrading && !closing && (idle || self.connected || !serial),
+        );
         self.ui.enable(
             Id::Send,
             self.connected && self.pending_send.is_none() && !self.upgrading,
@@ -977,8 +1136,9 @@ impl App {
             );
         }
         if let Some(upgrade) = &self.upgrade {
-            upgrade
-                .set_connection(self.connected && self.pending_send.is_none() && !self.upgrading);
+            upgrade.set_connection(
+                serial && self.connected && self.pending_send.is_none() && !self.upgrading,
+            );
         }
     }
 
@@ -1061,6 +1221,7 @@ impl App {
             });
             let dropdown_open = [
                 Id::Encoding,
+                Id::ConnectionMode,
                 Id::LogFont,
                 Id::LogFontSize,
                 Id::Port,
@@ -1118,7 +1279,9 @@ impl App {
         let Some(request) = self.upgrade.as_ref().and_then(UpgradeWindow::take_request) else {
             return;
         };
-        let result = if !self.connected {
+        let result = if self.mode() != Mode::Serial {
+            Err("N6 升级仅支持主窗口串口连接")
+        } else if !self.connected {
             Err("请先在主窗口打开串口")
         } else if self.pending_send.is_some() || self.upgrading {
             Err("串口正在发送或升级，请稍候")
@@ -1160,7 +1323,33 @@ impl App {
             session.commands.take();
             self.connected = false;
             self.update_controls();
-            self.status("正在关闭串口…");
+            self.status("正在关闭连接…");
+            return;
+        }
+
+        if self.mode() != Mode::Serial {
+            let preferences = self.read_network_preferences();
+            let settings = match preferences.settings() {
+                Ok(settings) => settings,
+                Err(error) => {
+                    self.status(&error.to_string());
+                    return;
+                }
+            };
+            if unsafe { SetTimer(self.ui.window, POLL_TIMER, 30, None) } == 0 {
+                self.status("未连接 · 无法启动网络状态检查");
+                return;
+            }
+            self.port_name = settings.description();
+            match network_io::connect(settings) {
+                Ok(session) => {
+                    self.session = Some(session);
+                    self.network_preferences = preferences;
+                    self.update_controls();
+                    self.status(&format!("正在打开 {}…", self.port_name));
+                }
+                Err(error) => self.disconnected(&format!("启动网络线程失败，{error}")),
+            }
             return;
         }
 
@@ -1253,10 +1442,11 @@ impl App {
             } else {
                 let result = SendResult {
                     requested: length,
-                    error: Some("串口线程未接收发送请求".into()),
+                    error: Some("通信线程未接收发送请求".into()),
                 };
                 let entry = LogEntry::sent(
                     Packet {
+                        peer: None,
                         time: serial_io::local_time(),
                         bytes: Vec::new(),
                     },
@@ -1310,6 +1500,26 @@ impl App {
                         self.ui.text(Id::Baud)
                     ));
                 }
+                Ok(Event::NetworkState {
+                    ready,
+                    description,
+                    reset,
+                }) => {
+                    self.connected = ready
+                        && self
+                            .session
+                            .as_ref()
+                            .is_some_and(|session| session.commands.is_some());
+                    if reset {
+                        self.rx = 0;
+                        self.tx = 0;
+                        self.update_counter();
+                    }
+                    self.first_receive_in_session = true;
+                    self.port_name = description;
+                    self.update_controls();
+                    self.status(&self.port_name);
+                }
                 Ok(Event::Received(packets)) => {
                     for packet in packets {
                         self.rx += packet.bytes.len() as u64;
@@ -1317,6 +1527,7 @@ impl App {
                             packet,
                             send_result: None,
                             annotation: false,
+                            datagram: self.mode() == Mode::Udp,
                             omitted: 0,
                             starts_session: std::mem::take(&mut self.first_receive_in_session),
                         });
@@ -1335,7 +1546,7 @@ impl App {
                     batches.push(entry);
                 }
                 Ok(Event::Closed(error)) => {
-                    self.disconnected(error.as_deref().unwrap_or("串口已关闭"));
+                    self.disconnected(error.as_deref().unwrap_or("连接已关闭"));
                     break;
                 }
                 Ok(Event::Upgrade(event)) => {
@@ -1371,7 +1582,7 @@ impl App {
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    self.disconnected("串口线程已退出");
+                    self.disconnected("通信线程已退出");
                     break;
                 }
             }
@@ -1382,6 +1593,7 @@ impl App {
         {
             batches.push(LogEntry::sent(
                 Packet {
+                    peer: None,
                     time: serial_io::local_time(),
                     bytes: Vec::new(),
                 },
@@ -1491,6 +1703,16 @@ impl App {
             }
         } else if notification == CBN_SELCHANGE {
             match id {
+                x if x == Id::ConnectionMode as usize => {
+                    if self.session.is_none() {
+                        self.update_controls();
+                        if self.mode() == Mode::Serial {
+                            self.refresh_ports();
+                        } else {
+                            self.status("未连接 · 请设置网络地址和端口");
+                        }
+                    }
+                }
                 x if x == Id::Encoding as usize => self.reset_receive_format(),
                 x if x == Id::LogFont as usize || x == Id::LogFontSize as usize => {
                     self.ui.apply_log_font()
@@ -1510,6 +1732,7 @@ struct LogEntry {
     packet: Packet,
     send_result: Option<SendResult>,
     annotation: bool,
+    datagram: bool,
     omitted: usize,
     starts_session: bool,
 }
@@ -1518,11 +1741,13 @@ impl LogEntry {
     fn note(text: String) -> Self {
         Self {
             packet: Packet {
+                peer: None,
                 time: serial_io::local_time(),
                 bytes: text.into_bytes(),
             },
             send_result: None,
             annotation: true,
+            datagram: false,
             omitted: 0,
             starts_session: false,
         }
@@ -1533,6 +1758,7 @@ impl LogEntry {
             packet,
             send_result: Some(result),
             annotation: false,
+            datagram: false,
             omitted: 0,
             starts_session: false,
         }
@@ -1566,9 +1792,11 @@ impl LogEntry {
         if self.starts_session {
             *receive_format = ReceiveFormat::new(hex, encoding);
         }
-        let data = if self.annotation {
+        let data = if self.datagram && self.packet.bytes.is_empty() {
+            "[空报文]".to_string()
+        } else if self.annotation {
             String::from_utf8_lossy(&self.packet.bytes).into_owned()
-        } else if self.send_result.is_some() {
+        } else if self.send_result.is_some() || self.datagram {
             ReceiveFormat::new(hex, encoding).format_batch(&self.packet.bytes, true)
         } else {
             receive_format.format_batch(&self.packet.bytes, false)
@@ -1596,6 +1824,9 @@ impl LogEntry {
             }
         } else {
             display.push_str("收←◆");
+        }
+        if let Some(peer) = self.packet.peer {
+            let _ = write!(display, "[{peer}] ");
         }
         if self.omitted != 0 {
             let _ = write!(display, "[前 {} 字节已裁剪] ", self.omitted);
@@ -1695,7 +1926,7 @@ pub fn run() -> io::Result<()> {
         } else {
             SW_SHOWNORMAL
         };
-        let app = RefCell::new(App::new(ui, preferences));
+        let app = RefCell::new(App::new(ui, preferences, network_io::Preferences::load()));
         // The state lives until the window is destroyed and the message loop returns.
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, &raw const app as isize);
         ShowWindow(hwnd, show);
@@ -2125,6 +2356,7 @@ mod tests {
             let app = RefCell::new(App::new(
                 Ui::new(host, instance, 96).unwrap(),
                 Preferences::default(),
+                network_io::Preferences::default(),
             ));
             SetWindowLongPtrW(host, GWLP_USERDATA, &raw const app as isize);
             let shortcuts = ExtensionShortcuts::new().unwrap();
@@ -2231,7 +2463,11 @@ mod tests {
             (host, rich_edit, instance)
         };
         assert!(!host.is_null() && !rich_edit.is_null());
-        let mut app = App::new(Ui::new(host, instance, 96).unwrap(), Preferences::default());
+        let mut app = App::new(
+            Ui::new(host, instance, 96).unwrap(),
+            Preferences::default(),
+            network_io::Preferences::default(),
+        );
         app.ui.layout();
         let (commands, command_rx) = mpsc::sync_channel(1);
         let (event_tx, events) = mpsc::sync_channel(32);
@@ -2265,6 +2501,7 @@ mod tests {
         event_tx
             .send(Event::Sent {
                 packet: Packet {
+                    peer: None,
                     time: first,
                     bytes: data.clone(),
                 },
@@ -2274,6 +2511,7 @@ mod tests {
             .unwrap();
         event_tx
             .send(Event::Received(vec![Packet {
+                peer: None,
                 time: first,
                 bytes: data[..2].to_vec(),
             }]))
@@ -2281,6 +2519,7 @@ mod tests {
         app.poll();
         event_tx
             .send(Event::Received(vec![Packet {
+                peer: None,
                 time: second,
                 bytes: data[2..].to_vec(),
             }]))
@@ -2328,6 +2567,7 @@ mod tests {
             event_tx
                 .send(Event::Sent {
                     packet: Packet {
+                        peer: None,
                         time: second,
                         bytes: written,
                     },
@@ -2343,6 +2583,7 @@ mod tests {
         assert_eq!(app.ui.text(Id::Counter), "RX 8 字节     TX 9 字节");
         event_tx
             .send(Event::Received(vec![Packet {
+                peer: None,
                 time: second,
                 bytes: vec![0x55; HISTORY_LIMIT],
             }]))
@@ -2356,6 +2597,7 @@ mod tests {
 
         event_tx
             .send(Event::Received(vec![Packet {
+                peer: None,
                 time: first,
                 bytes: b"old".to_vec(),
             }]))
@@ -2380,6 +2622,7 @@ mod tests {
         assert_eq!((app.rx, app.tx), (0, 0));
         event_tx
             .send(Event::Received(vec![Packet {
+                peer: None,
                 time: second,
                 bytes: b"new".to_vec(),
             }]))
@@ -2441,6 +2684,7 @@ mod tests {
             event_tx
                 .send(Event::Sent {
                     packet: Packet {
+                        peer: None,
                         time: second,
                         bytes: expected.to_vec(),
                     },

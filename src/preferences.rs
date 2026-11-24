@@ -50,7 +50,7 @@ impl Default for Preferences {
             width: 940,
             height: 610,
             serial_width: 330,
-            lower_height: 180,
+            lower_height: 210,
             maximized: false,
             timestamps: false,
             log_font: DEFAULT_LOG_FONT,
