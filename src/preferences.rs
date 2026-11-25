@@ -30,8 +30,19 @@ pub fn save_settings_file(path: &Path, contents: &[u8]) -> io::Result<()> {
 
 pub const LOG_FONT_COUNT: usize = 4;
 pub const LOG_FONT_SIZES: [i32; 9] = [9, 10, 11, 12, 14, 16, 18, 20, 24];
-pub const BUFFER_SIZES: [usize; 3] = [512 * 1024, 1024 * 1024, 2 * 1024 * 1024];
-pub const BUFFER_LABELS: [&str; 3] = ["512 KB", "1 MB", "2 MB"];
+pub const BUFFER_SIZES: [usize; 8] = [
+    512 * 1024,
+    1024 * 1024,
+    2 * 1024 * 1024,
+    4 * 1024 * 1024,
+    8 * 1024 * 1024,
+    16 * 1024 * 1024,
+    24 * 1024 * 1024,
+    48 * 1024 * 1024,
+];
+pub const BUFFER_LABELS: [&str; 8] = [
+    "512 KB", "1 MB", "2 MB", "4 MB", "8 MB", "16 MB", "24 MB", "48 MB",
+];
 pub const DEFAULT_BUFFER_SIZE: usize = 1024 * 1024;
 const DEFAULT_LOG_FONT: usize = 0;
 const DEFAULT_LOG_FONT_SIZE: usize = 3;

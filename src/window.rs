@@ -729,7 +729,7 @@ impl Ui {
             (Send, width - 120, bottom + 54, 90, MIN_LOWER_HEIGHT - 67),
             (Status, MARGIN, height - 31, width - 456, 22),
             (BufferLabel, width - 424, height - 31, 36, 22),
-            (BufferSize, width - 386, height - 34, 102, 150),
+            (BufferSize, width - 386, height - 34, 102, 260),
             (Counter, width - 260, height - 31, 244, 22),
         ];
         self.child_layout.apply(
