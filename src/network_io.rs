@@ -8,7 +8,8 @@ use std::os::windows::io::AsRawSocket;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Networking::WinSock::{
-    POLLNVAL, POLLRDNORM, POLLWRNORM, SOCKET_ERROR, WSAGetLastError, WSAPOLLFD, WSAPoll,
+    POLLNVAL, POLLRDNORM, POLLWRNORM, SO_RCVBUF, SOCKET_ERROR, SOL_SOCKET, WSAGetLastError,
+    WSAPOLLFD, WSAPoll, getsockopt, setsockopt,
 };
 
 const UDP_BATCH_PACKETS: usize = 128;
@@ -137,16 +138,18 @@ impl Settings {
     }
 }
 
-pub fn connect(settings: Settings) -> io::Result<Connection> {
+pub fn connect(settings: Settings, buffer_size: usize) -> io::Result<Connection> {
     let (commands, requests) = mpsc::sync_channel(1);
     let (events, receiver) = mpsc::sync_channel(32);
     std::thread::Builder::new()
         .name("network-io".into())
         .spawn(move || {
             let result = match settings {
-                Settings::TcpClient(remote) => client(remote, &requests, &events),
-                Settings::TcpServer(local) => server(local, &requests, &events),
-                Settings::Udp { local, remote } => udp(local, remote, &requests, &events),
+                Settings::TcpClient(remote) => client(remote, &requests, &events, buffer_size),
+                Settings::TcpServer(local) => server(local, &requests, &events, buffer_size),
+                Settings::Udp { local, remote } => {
+                    udp(local, remote, &requests, &events, buffer_size)
+                }
             };
             let _ = events.send(Event::Closed(
                 result.err().map(|error| format!("网络连接结束 · {error}")),
@@ -180,8 +183,60 @@ fn state(
     )
 }
 
-fn resolve(command: Command, events: &SyncSender<Event>) -> io::Result<Option<Vec<u8>>> {
+fn set_receive_buffer(socket: &impl AsRawSocket, requested: usize) -> io::Result<usize> {
+    let value =
+        i32::try_from(requested).map_err(|_| io::Error::other("接收缓冲大小超出系统范围"))?;
+    let handle = socket.as_raw_socket() as usize;
+    let mut actual = 0i32;
+    let mut length = size_of::<i32>() as i32;
+    unsafe {
+        if setsockopt(
+            handle,
+            SOL_SOCKET,
+            SO_RCVBUF,
+            (&raw const value).cast(),
+            length,
+        ) == SOCKET_ERROR
+            || getsockopt(
+                handle,
+                SOL_SOCKET,
+                SO_RCVBUF,
+                (&raw mut actual).cast(),
+                &mut length,
+            ) == SOCKET_ERROR
+        {
+            return Err(io::Error::from_raw_os_error(WSAGetLastError()));
+        }
+    }
+    usize::try_from(actual).map_err(|_| io::Error::other("系统返回了无效的接收缓冲大小"))
+}
+
+fn buffer_result(
+    events: &SyncSender<Event>,
+    requested: usize,
+    result: io::Result<usize>,
+    update: bool,
+) -> io::Result<()> {
+    emit(
+        events,
+        Event::ReceiveBuffer {
+            requested,
+            actual: result.map_err(|error| error.to_string()),
+            update,
+        },
+    )
+}
+
+fn resolve(
+    command: Command,
+    events: &SyncSender<Event>,
+    socket: &impl AsRawSocket,
+) -> io::Result<Option<Vec<u8>>> {
     match command {
+        Command::SetReceiveBuffer(size) => {
+            buffer_result(events, size, set_receive_buffer(socket, size), true)?;
+            Ok(None)
+        }
         Command::Send(bytes) => Ok(Some(bytes)),
         Command::SendTime { format, ending } => Ok(Some(format.payload(local_time(), ending))),
         Command::Upgrade(_) => {
@@ -349,8 +404,10 @@ fn client(
     remote: SocketAddr,
     commands: &Receiver<Command>,
     events: &SyncSender<Event>,
+    buffer_size: usize,
 ) -> io::Result<()> {
     let stream = TcpStream::connect_timeout(&remote, Duration::from_secs(3))?;
+    let actual = set_receive_buffer(&stream, buffer_size)?;
     let local = stream.local_addr()?;
     let mut peer = Peer::new(stream)?;
     state(
@@ -359,10 +416,11 @@ fn client(
         format!("TCP 客户端 {local} ↔ {remote} · 已连接"),
         true,
     )?;
+    buffer_result(events, buffer_size, Ok(actual), false)?;
     let result = loop {
         match commands.try_recv() {
             Ok(command) => {
-                if let Some(bytes) = resolve(command, events)? {
+                if let Some(bytes) = resolve(command, events, &peer.stream)? {
                     peer.send(bytes, events)?;
                 }
             }
@@ -382,8 +440,10 @@ fn server(
     local: SocketAddr,
     commands: &Receiver<Command>,
     events: &SyncSender<Event>,
+    mut buffer_size: usize,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(local)?;
+    let actual = set_receive_buffer(&listener, buffer_size)?;
     listener.set_nonblocking(true)?;
     let local = listener.local_addr()?;
     state(
@@ -392,11 +452,23 @@ fn server(
         format!("TCP 服务端 {local} · 正在监听，等待客户端"),
         true,
     )?;
+    buffer_result(events, buffer_size, Ok(actual), false)?;
     let mut peer: Option<Peer> = None;
     let result = loop {
         match commands.try_recv() {
+            Ok(Command::SetReceiveBuffer(size)) => {
+                buffer_size = size;
+                let result = set_receive_buffer(&listener, size).and_then(|actual| {
+                    if let Some(active) = &peer {
+                        set_receive_buffer(&active.stream, size)
+                    } else {
+                        Ok(actual)
+                    }
+                });
+                buffer_result(events, size, result, true)?;
+            }
             Ok(command) => {
-                if let Some(bytes) = resolve(command, events)? {
+                if let Some(bytes) = resolve(command, events, &listener)? {
                     if let Some(peer) = &mut peer {
                         peer.send(bytes, events)?;
                     } else {
@@ -410,6 +482,7 @@ fn server(
         match listener.accept() {
             Ok((stream, address)) => {
                 if peer.is_none() {
+                    set_receive_buffer(&stream, buffer_size)?;
                     peer = Some(Peer::new(stream)?);
                     state(
                         events,
@@ -466,8 +539,10 @@ fn udp(
     remote: SocketAddr,
     commands: &Receiver<Command>,
     events: &SyncSender<Event>,
+    buffer_size: usize,
 ) -> io::Result<()> {
     let socket = UdpSocket::bind(local)?;
+    let actual = set_receive_buffer(&socket, buffer_size)?;
     socket.set_nonblocking(true)?;
     if local.is_ipv4() {
         socket.set_broadcast(true)?;
@@ -479,12 +554,13 @@ fn udp(
         format!("UDP {local} → {remote} · 已打开"),
         true,
     )?;
+    buffer_result(events, buffer_size, Ok(actual), false)?;
     let mut outgoing: Option<Outgoing> = None;
     let mut buffer = vec![0; 65536];
     let result = loop {
         match commands.try_recv() {
             Ok(command) => {
-                if let Some(bytes) = resolve(command, events)? {
+                if let Some(bytes) = resolve(command, events, &socket)? {
                     if bytes.len() > 65507 {
                         sent(
                             events,

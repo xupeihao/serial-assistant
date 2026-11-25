@@ -29,6 +29,11 @@ pub enum Event {
         description: String,
         reset: bool,
     },
+    ReceiveBuffer {
+        requested: usize,
+        actual: Result<usize, String>,
+        update: bool,
+    },
     Received(Vec<Packet>),
     Sent {
         packet: Packet,
@@ -40,6 +45,7 @@ pub enum Event {
 }
 
 pub enum Command {
+    SetReceiveBuffer(usize),
     Send(Vec<u8>),
     SendTime { format: TimeFormat, ending: Ending },
     Upgrade(Box<Request>),
@@ -159,6 +165,7 @@ fn exchange(
     let write_chunk = (settings.baud as usize / 120).clamp(1, 8192);
     let closed = loop {
         match commands.try_recv() {
+            Ok(Command::SetReceiveBuffer(_)) => (),
             Ok(Command::Send(data)) => outgoing = Some((data, 0)),
             Ok(Command::SendTime { format, ending }) => {
                 // Resolve the clock in the serial worker, immediately before its first write.

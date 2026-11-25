@@ -30,6 +30,9 @@ pub fn save_settings_file(path: &Path, contents: &[u8]) -> io::Result<()> {
 
 pub const LOG_FONT_COUNT: usize = 4;
 pub const LOG_FONT_SIZES: [i32; 9] = [9, 10, 11, 12, 14, 16, 18, 20, 24];
+pub const BUFFER_SIZES: [usize; 3] = [512 * 1024, 1024 * 1024, 2 * 1024 * 1024];
+pub const BUFFER_LABELS: [&str; 3] = ["512 KB", "1 MB", "2 MB"];
+pub const DEFAULT_BUFFER_SIZE: usize = 1024 * 1024;
 const DEFAULT_LOG_FONT: usize = 0;
 const DEFAULT_LOG_FONT_SIZE: usize = 3;
 
@@ -42,6 +45,7 @@ pub struct Preferences {
     pub timestamps: bool,
     pub log_font: usize,
     pub log_font_size: usize,
+    pub buffer_size: usize,
 }
 
 impl Default for Preferences {
@@ -55,6 +59,7 @@ impl Default for Preferences {
             timestamps: false,
             log_font: DEFAULT_LOG_FONT,
             log_font_size: DEFAULT_LOG_FONT_SIZE,
+            buffer_size: DEFAULT_BUFFER_SIZE,
         }
     }
 }
@@ -80,7 +85,7 @@ impl Preferences {
 
     fn save_to(&self, path: &Path) -> io::Result<()> {
         let contents = format!(
-            "2 {} {} {} {} {} {} {} {}\n",
+            "3 {} {} {} {} {} {} {} {} {}\n",
             self.width,
             self.height,
             self.serial_width,
@@ -89,6 +94,7 @@ impl Preferences {
             self.timestamps,
             self.log_font,
             self.log_font_size,
+            self.buffer_size,
         );
         save_settings_file(path, contents.as_bytes())
     }
@@ -96,7 +102,7 @@ impl Preferences {
     fn parse(text: &str) -> Option<Self> {
         let mut parts = text.split_ascii_whitespace();
         let version = parts.next()?;
-        if version != "1" && version != "2" {
+        if !["1", "2", "3"].contains(&version) {
             return None;
         }
         let mut dimension = || {
@@ -119,13 +125,22 @@ impl Preferences {
                 .filter(|&index| index < count)
                 .unwrap_or(default)
         };
-        let (log_font, log_font_size) = if version == "2" {
+        let (log_font, log_font_size) = if version != "1" {
             (
                 font_option(LOG_FONT_COUNT, DEFAULT_LOG_FONT),
                 font_option(LOG_FONT_SIZES.len(), DEFAULT_LOG_FONT_SIZE),
             )
         } else {
             (DEFAULT_LOG_FONT, DEFAULT_LOG_FONT_SIZE)
+        };
+        let buffer_size = if version == "3" {
+            parts
+                .next()
+                .and_then(|part| part.parse().ok())
+                .filter(|value| BUFFER_SIZES.contains(value))
+                .unwrap_or(DEFAULT_BUFFER_SIZE)
+        } else {
+            DEFAULT_BUFFER_SIZE
         };
         if parts.next().is_some() {
             return None;
@@ -139,6 +154,7 @@ impl Preferences {
             timestamps,
             log_font,
             log_font_size,
+            buffer_size,
         })
     }
 }

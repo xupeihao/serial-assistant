@@ -2,7 +2,9 @@ use crate::codec::{self, ReceiveFormat};
 use crate::control::{self, ControlWindow};
 use crate::file_dialog;
 use crate::network_io::{self, Mode};
-use crate::preferences::{LOG_FONT_COUNT, LOG_FONT_SIZES, Preferences};
+use crate::preferences::{
+    BUFFER_LABELS, BUFFER_SIZES, LOG_FONT_COUNT, LOG_FONT_SIZES, Preferences,
+};
 use crate::serial_io::{self, Command, Connection, Event, Packet, Settings};
 use crate::upgrade::{self, UpgradeWindow};
 use crate::upgrade_protocol::Event as UpgradeEvent;
@@ -90,9 +92,8 @@ impl Drop for ExtensionShortcuts {
         unsafe { DestroyAcceleratorTable(self.0) };
     }
 }
-const HISTORY_LIMIT: usize = 96 * 1024;
-const HISTORY_RETAIN: usize = 64 * 1024;
-const HISTORY_BATCH_LIMIT: usize = 4096;
+const HISTORY_BASE_BYTES: usize = 96 * 1024;
+const HISTORY_BASE_RECORDS: usize = 4096;
 // Rich Edit messages from richedit.h.
 const EM_EXLIMITTEXT: u32 = WM_USER + 53;
 const EM_SETBKGNDCOLOR: u32 = WM_USER + 67;
@@ -292,10 +293,12 @@ enum Id {
     LocalPortLabel,
     LocalPort,
     NetworkHint,
+    BufferLabel,
+    BufferSize,
 }
 
 impl Id {
-    const COUNT: usize = Self::NetworkHint as usize - Self::ReceiveLabel as usize + 1;
+    const COUNT: usize = Self::BufferSize as usize - Self::ReceiveLabel as usize + 1;
 
     fn index(self) -> usize {
         self as usize - Self::ReceiveLabel as usize
@@ -382,6 +385,8 @@ impl Ui {
             (Send, Button, "发送\r\nCtrl+Enter"),
             (Status, Label, ""),
             (Counter, RightLabel, ""),
+            (BufferLabel, Label, "缓存"),
+            (BufferSize, List, ""),
         ];
         let mut ui = Self {
             window,
@@ -467,12 +472,6 @@ impl Ui {
             ui.message(id, WM_SETFONT, font as usize, 0);
         }
 
-        ui.message(
-            Receive,
-            EM_EXLIMITTEXT,
-            0,
-            (HISTORY_LIMIT * 4 + HISTORY_BATCH_LIMIT * 128) as isize,
-        );
         ui.message(Receive, EM_SETBKGNDCOLOR, 0, 0x00ff_ffff);
         ui.message(SendText, EM_SETLIMITTEXT, 65536, 0);
         ui.message(Follow, BM_SETCHECK, BST_CHECKED as usize, 0);
@@ -501,6 +500,17 @@ impl Ui {
     }
 
     fn init_log_font(&self, preferences: &Preferences) {
+        self.fill(
+            Id::BufferSize,
+            &BUFFER_LABELS,
+            Some(
+                BUFFER_SIZES
+                    .iter()
+                    .position(|&size| size == preferences.buffer_size)
+                    .unwrap_or(1),
+            ),
+        );
+        self.set_history_capacity(preferences.buffer_size);
         self.fill(
             Id::LogFont,
             &LOG_FONTS.map(|(label, _)| label),
@@ -577,6 +587,16 @@ impl Ui {
 
     fn enable(&self, id: Id, enabled: bool) {
         unsafe { EnableWindow(self.handle(id), i32::from(enabled)) };
+    }
+
+    fn set_history_capacity(&self, bytes: usize) {
+        let records = bytes * HISTORY_BASE_RECORDS / HISTORY_BASE_BYTES;
+        self.message(
+            Id::Receive,
+            EM_EXLIMITTEXT,
+            0,
+            (bytes * 4 + records * 128) as isize,
+        );
     }
 
     fn show(&self, id: Id, visible: bool) {
@@ -707,7 +727,9 @@ impl Ui {
                 lower_height - 67,
             ),
             (Send, width - 120, bottom + 54, 90, MIN_LOWER_HEIGHT - 67),
-            (Status, MARGIN, height - 31, width - 285, 22),
+            (Status, MARGIN, height - 31, width - 456, 22),
+            (BufferLabel, width - 424, height - 31, 36, 22),
+            (BufferSize, width - 386, height - 34, 102, 150),
             (Counter, width - 260, height - 31, 244, 22),
         ];
         self.child_layout.apply(
@@ -894,6 +916,8 @@ struct App {
     connected: bool,
     upgrading: bool,
     pending_send: Option<usize>,
+    pending_buffer_size: Option<usize>,
+    buffer_update_in_flight: Option<usize>,
     port_name: String,
     history: VecDeque<LogEntry>,
     history_bytes: usize,
@@ -926,6 +950,8 @@ impl App {
             connected: false,
             upgrading: false,
             pending_send: None,
+            pending_buffer_size: None,
+            buffer_update_in_flight: None,
             port_name: String::new(),
             history: VecDeque::new(),
             history_bytes: 0,
@@ -969,6 +995,7 @@ impl App {
         self.preferences.timestamps = self.ui.checked(Id::Timestamps);
         self.preferences.log_font = self.ui.selected(Id::LogFont);
         self.preferences.log_font_size = self.ui.selected(Id::LogFontSize);
+        self.preferences.buffer_size = BUFFER_SIZES[self.ui.selected(Id::BufferSize)];
         self.network_preferences = self.read_network_preferences();
         self.preferences.save()?;
         self.network_preferences.save()
@@ -1126,13 +1153,13 @@ impl App {
         );
         self.ui.enable(
             Id::Send,
-            self.connected && self.pending_send.is_none() && !self.upgrading,
+            self.connected && self.pending_send.is_none() && !self.upgrading && !self.buffer_busy(),
         );
         self.ui.enable(Id::Ending, !self.ui.checked(Id::HexSend));
         if let Some(control) = &self.control {
             control.set_connection(
                 self.connected,
-                self.pending_send.is_some() || self.upgrading,
+                self.pending_send.is_some() || self.upgrading || self.buffer_busy(),
             );
         }
         if let Some(upgrade) = &self.upgrade {
@@ -1155,7 +1182,7 @@ impl App {
         let control = self.control.as_ref().unwrap();
         control.set_connection(
             self.connected,
-            self.pending_send.is_some() || self.upgrading,
+            self.pending_send.is_some() || self.upgrading || self.buffer_busy(),
         );
         control.status(&self.ui.text(Id::Status));
         control.show();
@@ -1222,6 +1249,7 @@ impl App {
             let dropdown_open = [
                 Id::Encoding,
                 Id::ConnectionMode,
+                Id::BufferSize,
                 Id::LogFont,
                 Id::LogFontSize,
                 Id::Port,
@@ -1341,7 +1369,7 @@ impl App {
                 return;
             }
             self.port_name = settings.description();
-            match network_io::connect(settings) {
+            match network_io::connect(settings, self.preferences.buffer_size) {
                 Ok(session) => {
                     self.session = Some(session);
                     self.network_preferences = preferences;
@@ -1424,7 +1452,7 @@ impl App {
     }
 
     fn queue_send(&mut self, command: Command, length: usize) {
-        if !self.connected || self.pending_send.is_some() || self.upgrading {
+        if !self.connected || self.pending_send.is_some() || self.upgrading || self.buffer_busy() {
             return;
         }
         if let Some(commands) = self
@@ -1479,10 +1507,62 @@ impl App {
     fn clear_receive(&mut self) {
         self.history.clear();
         self.history_bytes = 0;
+        self.rx = 0;
+        self.tx = 0;
+        self.update_counter();
+        self.first_receive_in_session = true;
         self.reset_receive_format();
     }
 
+    fn history_limit(&self) -> usize {
+        self.preferences.buffer_size
+    }
+
+    fn history_retain(&self) -> usize {
+        self.history_limit() * 3 / 4
+    }
+
+    fn history_record_limit(&self) -> usize {
+        self.history_limit() * HISTORY_BASE_RECORDS / HISTORY_BASE_BYTES
+    }
+
+    fn change_buffer_size(&mut self) {
+        let bytes = BUFFER_SIZES[self.ui.selected(Id::BufferSize)];
+        self.preferences.buffer_size = bytes;
+        self.ui.set_history_capacity(bytes);
+        if self.history_bytes > bytes || self.history.len() > self.history_record_limit() {
+            self.trim_history();
+            self.reset_receive_format();
+        }
+        if self.mode() != Mode::Serial && self.session.is_some() {
+            self.pending_buffer_size = Some(bytes);
+            self.flush_buffer_update();
+        }
+        self.update_controls();
+    }
+
+    fn buffer_busy(&self) -> bool {
+        self.pending_buffer_size.is_some() || self.buffer_update_in_flight.is_some()
+    }
+
+    fn flush_buffer_update(&mut self) {
+        if self.buffer_update_in_flight.is_some() {
+            return;
+        }
+        if let Some(bytes) = self.pending_buffer_size
+            && let Some(commands) = self
+                .session
+                .as_ref()
+                .and_then(|session| session.commands.as_ref())
+            && commands.try_send(Command::SetReceiveBuffer(bytes)).is_ok()
+        {
+            self.pending_buffer_size = None;
+            self.buffer_update_in_flight = Some(bytes);
+        }
+    }
+
     fn poll(&mut self) {
+        self.flush_buffer_update();
         let mut batches = Vec::new();
         for _ in 0..32 {
             let Some(session) = &self.session else { break };
@@ -1519,6 +1599,28 @@ impl App {
                     self.port_name = description;
                     self.update_controls();
                     self.status(&self.port_name);
+                }
+                Ok(Event::ReceiveBuffer {
+                    requested,
+                    actual,
+                    update,
+                }) => {
+                    if update && self.buffer_update_in_flight == Some(requested) {
+                        self.buffer_update_in_flight = None;
+                        self.flush_buffer_update();
+                        self.update_controls();
+                    }
+                    if requested == self.preferences.buffer_size {
+                        match actual {
+                            Ok(size) if size != requested => self.status(&format!(
+                                "接收缓存申请 {} KB，系统实际设置 {} KB",
+                                requested / 1024,
+                                size / 1024
+                            )),
+                            Err(error) => self.status(&format!("网络接收缓存设置失败 · {error}")),
+                            _ => (),
+                        }
+                    }
                 }
                 Ok(Event::Received(packets)) => {
                     for packet in packets {
@@ -1614,8 +1716,8 @@ impl App {
             .iter()
             .map(|entry| entry.packet.bytes.len())
             .sum::<usize>();
-        if self.history_bytes > HISTORY_LIMIT
-            || self.history.len() + batches.len() > HISTORY_BATCH_LIMIT
+        if self.history_bytes > self.history_limit()
+            || self.history.len() + batches.len() > self.history_record_limit()
         {
             self.history.extend(batches);
             self.trim_history();
@@ -1640,16 +1742,17 @@ impl App {
     }
 
     fn trim_history(&mut self) {
-        while self.history.len() > HISTORY_BATCH_LIMIT * 3 / 4 {
+        let retain = self.history_retain();
+        while self.history.len() > self.history_record_limit() * 3 / 4 {
             self.history_bytes -= self.history.pop_front().unwrap().packet.bytes.len();
         }
-        while self.history_bytes > HISTORY_RETAIN {
+        while self.history_bytes > retain {
             let front = self.history.front_mut().unwrap();
-            let excess = self.history_bytes - HISTORY_RETAIN;
+            let excess = self.history_bytes - retain;
             if front.packet.bytes.len() > excess {
                 front.packet.bytes.drain(..excess);
                 front.omitted += excess;
-                self.history_bytes = HISTORY_RETAIN;
+                self.history_bytes = retain;
             } else {
                 self.history_bytes -= front.packet.bytes.len();
                 self.history.pop_front();
@@ -1660,6 +1763,8 @@ impl App {
     fn disconnected(&mut self, reason: &str) {
         self.session = None;
         self.connected = false;
+        self.pending_buffer_size = None;
+        self.buffer_update_in_flight = None;
         if self.upgrading {
             self.upgrading = false;
             if let Some(upgrade) = &self.upgrade {
@@ -1703,6 +1808,7 @@ impl App {
             }
         } else if notification == CBN_SELCHANGE {
             match id {
+                x if x == Id::BufferSize as usize => self.change_buffer_size(),
                 x if x == Id::ConnectionMode as usize => {
                     if self.session.is_none() {
                         self.update_controls();
@@ -2585,15 +2691,15 @@ mod tests {
             .send(Event::Received(vec![Packet {
                 peer: None,
                 time: second,
-                bytes: vec![0x55; HISTORY_LIMIT],
+                bytes: vec![0x55; app.history_limit()],
             }]))
             .unwrap();
         app.poll();
-        assert_eq!(app.history_bytes, HISTORY_RETAIN);
+        assert_eq!(app.history_bytes, app.history_retain());
         assert!(app.ui.text(Id::Receive).trim_end().ends_with("55 55"));
         app.clear_receive();
         assert!(app.ui.text(Id::Receive).is_empty());
-        assert_eq!(app.rx, (HISTORY_LIMIT + 8) as u64);
+        assert_eq!((app.rx, app.tx), (0, 0));
 
         event_tx
             .send(Event::Received(vec![Packet {
