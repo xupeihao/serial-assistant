@@ -4,8 +4,15 @@ use crate::upgrade_protocol;
 use serde::{Deserialize, Serialize};
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::os::windows::io::AsRawSocket;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::time::{Duration, Instant};
+use windows_sys::Win32::Networking::WinSock::{
+    POLLNVAL, POLLRDNORM, POLLWRNORM, SOCKET_ERROR, WSAGetLastError, WSAPOLLFD, WSAPoll,
+};
+
+const UDP_BATCH_PACKETS: usize = 128;
+const UDP_BATCH_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub enum Mode {
@@ -437,6 +444,23 @@ fn server(
     result
 }
 
+fn wait_udp(socket: &UdpSocket, writing: bool) -> io::Result<()> {
+    let mut descriptor = WSAPOLLFD {
+        fd: socket.as_raw_socket() as usize,
+        events: POLLRDNORM | if writing { POLLWRNORM } else { 0 },
+        revents: 0,
+    };
+    // A readable socket wakes immediately. The timeout only bounds how long an idle
+    // worker waits before checking new send requests or a closed command channel.
+    if unsafe { WSAPoll(&mut descriptor, 1, 10) } == SOCKET_ERROR {
+        return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+    }
+    if descriptor.revents & POLLNVAL != 0 {
+        return Err(io::Error::new(ErrorKind::NotConnected, "UDP 套接字已失效"));
+    }
+    Ok(())
+}
+
 fn udp(
     local: SocketAddr,
     remote: SocketAddr,
@@ -496,27 +520,56 @@ fn udp(
                 sent(events, outgoing.take().unwrap().bytes, count, remote, error)?;
             }
         }
-        match socket.recv_from(&mut buffer) {
-            Ok((count, peer)) => emit(
-                events,
-                Event::Received(vec![Packet {
-                    time: local_time(),
-                    bytes: buffer[..count].to_vec(),
-                    peer: Some(peer),
-                }]),
-            )?,
-            Err(error)
-                if retryable(&error)
-                    || matches!(
+        let mut packets = Vec::with_capacity(UDP_BATCH_PACKETS);
+        let mut bytes = 0;
+        let mut drained = false;
+        let mut receive_error = None;
+        // Drain queued datagrams without a per-packet delay. Batch limits give
+        // sending and closing a turn, and bound each UI event's memory usage.
+        for _ in 0..UDP_BATCH_PACKETS {
+            match socket.recv_from(&mut buffer) {
+                Ok((count, peer)) => {
+                    packets.push(Packet {
+                        time: local_time(),
+                        bytes: buffer[..count].to_vec(),
+                        peer: Some(peer),
+                    });
+                    bytes += count;
+                    if bytes >= UDP_BATCH_BYTES {
+                        break;
+                    }
+                }
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+                {
+                    drained = true;
+                    break;
+                }
+                Err(error)
+                    if matches!(
                         error.kind(),
-                        ErrorKind::ConnectionReset | ErrorKind::ConnectionRefused
+                        ErrorKind::Interrupted
+                            | ErrorKind::ConnectionReset
+                            | ErrorKind::ConnectionRefused
                     ) =>
-            {
-                ()
+                {
+                    ()
+                }
+                Err(error) => {
+                    receive_error = Some(error);
+                    break;
+                }
             }
-            Err(error) => break Err(error),
         }
-        std::thread::sleep(Duration::from_millis(2));
+        if !packets.is_empty() {
+            emit(events, Event::Received(packets))?;
+        }
+        if let Some(error) = receive_error {
+            break Err(error);
+        }
+        if drained {
+            wait_udp(&socket, outgoing.is_some())?;
+        }
     };
     if let Some(outgoing) = outgoing {
         let _ = sent(events, outgoing.bytes, 0, remote, Some("UDP 已关闭".into()));

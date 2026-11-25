@@ -1,6 +1,6 @@
 [package]
 name = "serial-assistant"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 
 [dependencies]
@@ -11,6 +11,7 @@ serialport = { version = "4.10.1", default-features = false }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_Networking_WinSock",
     "Win32_System_LibraryLoader",
     "Win32_System_SystemInformation",
     "Win32_System_SystemServices",
